@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "default_input_text"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "sudachi",
 ]
@@ -480,14 +480,14 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "join_katakana_oov"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "sudachi",
 ]
 
 [[package]]
 name = "join_numeric"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "sudachi",
 ]
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "simple_oov"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "sudachi",
 ]
@@ -900,11 +900,12 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "sudachi"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "aho-corasick",
  "bitflags",
  "claim",
+ "criterion",
  "csv",
  "default_input_text",
  "fancy-regex",
@@ -928,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "sudachi-cli"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "cfg-if",
  "clap",
@@ -948,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "sudachipy"
-version = "0.6.11"
+version = "0.6.12-a1"
 dependencies = [
  "pyo3",
  "scopeguard",

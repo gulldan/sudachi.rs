@@ -76,6 +76,11 @@ struct RegexProviderConfig {
 }
 
 impl OovProviderPlugin for RegexOovProvider {
+    #[cfg(feature = "profile")]
+    fn profile_kind(&self) -> crate::profiling::OovProviderKind {
+        crate::profiling::OovProviderKind::Regex
+    }
+
     fn set_up(
         &mut self,
         settings: &Value,
@@ -153,12 +158,18 @@ impl OovProviderPlugin for RegexOovProvider {
                 let match_length = match_end - match_start;
 
                 match other_words.has_word(match_length as i64) {
-                    HasWord::Yes => return Ok(0),
+                    HasWord::Yes => {
+                        #[cfg(feature = "profile")]
+                        crate::profiling::count_oov_suppressed_by_has_other_words();
+                        return Ok(0);
+                    }
                     HasWord::No => {} // do nothing
                     HasWord::Maybe => {
                         // need to check actual lengths for long words
                         for node in result.iter() {
                             if node.end() == match_end {
+                                #[cfg(feature = "profile")]
+                                crate::profiling::count_oov_suppressed_by_has_other_words();
                                 return Ok(0);
                             }
                         }

@@ -50,6 +50,11 @@ struct PluginSettings {
 }
 
 impl OovProviderPlugin for SimpleOovPlugin {
+    #[cfg(feature = "profile")]
+    fn profile_kind(&self) -> crate::profiling::OovProviderKind {
+        crate::profiling::OovProviderKind::Simple
+    }
+
     fn set_up(
         &mut self,
         settings: &Value,
@@ -73,6 +78,8 @@ impl OovProviderPlugin for SimpleOovPlugin {
         result: &mut Vec<Node>,
     ) -> SudachiResult<usize> {
         if other_words.not_empty() {
+            #[cfg(feature = "profile")]
+            crate::profiling::count_oov_suppressed_by_has_other_words();
             return Ok(0);
         }
 
@@ -87,5 +94,9 @@ impl OovProviderPlugin for SimpleOovPlugin {
             WordId::oov(self.oov_pos_id as u32),
         ));
         Ok(1)
+    }
+
+    fn needs_oov_buffer_context(&self) -> bool {
+        false
     }
 }

@@ -44,7 +44,7 @@ impl NodeIdx {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Node {
     begin: u16,
     end: u16,

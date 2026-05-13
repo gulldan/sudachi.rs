@@ -25,11 +25,19 @@ use crate::error::SudachiNomResult;
 
 pub fn u32_array_parser(input: &[u8]) -> SudachiNomResult<&[u8], Vec<u32>> {
     let (rest, length) = le_u8(input)?;
+    #[cfg(feature = "profile")]
+    if length > 0 {
+        crate::profiling::count_vec_allocation();
+    }
     nom::multi::count(le_u32, length as usize)(rest)
 }
 
 pub fn u32_wid_array_parser(input: &[u8]) -> SudachiNomResult<&[u8], Vec<WordId>> {
     let (rest, length) = le_u8(input)?;
+    #[cfg(feature = "profile")]
+    if length > 0 {
+        crate::profiling::count_vec_allocation();
+    }
     nom::multi::count(le_u32.map(WordId::from_raw), length as usize)(rest)
 }
 

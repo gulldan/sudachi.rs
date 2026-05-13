@@ -33,6 +33,11 @@ pub mod simple_oov;
 
 /// Trait of plugin to provide oov node during tokenization
 pub trait OovProviderPlugin: Sync + Send {
+    #[cfg(feature = "profile")]
+    fn profile_kind(&self) -> crate::profiling::OovProviderKind {
+        crate::profiling::OovProviderKind::Other
+    }
+
     /// Loads necessary information for the plugin
     fn set_up(
         &mut self,
@@ -50,6 +55,13 @@ pub trait OovProviderPlugin: Sync + Send {
         other_words: CreatedWords,
         result: &mut Vec<Node>,
     ) -> SudachiResult<usize>;
+
+    /// Whether this provider needs previously emitted nodes in the shared
+    /// OOV result buffer. Providers that only inspect `CreatedWords` can opt
+    /// out so the tokenizer can reuse a smaller OOV scratch buffer.
+    fn needs_oov_buffer_context(&self) -> bool {
+        true
+    }
 }
 
 impl PluginCategory for dyn OovProviderPlugin {

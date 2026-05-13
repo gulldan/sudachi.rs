@@ -70,6 +70,21 @@ impl<'a> ConnectionMatrix<'a> {
         *unsafe { self.data.get_unchecked(index) }
     }
 
+    /// Gets all connection costs for a fixed right-side node left ID.
+    ///
+    /// The dictionary stores costs as `[right][left]`, so this is the hot
+    /// layout for Viterbi predecessor scans where `right` is fixed and
+    /// predecessor right IDs vary.
+    #[inline(always)]
+    pub(crate) fn costs_for_right(&self, right: u16) -> &[i16] {
+        let uright = right as usize;
+        debug_assert!(uright < self.num_right);
+        let start = uright * self.num_left;
+        let end = start + self.num_left;
+        debug_assert!(end <= self.data.len());
+        unsafe { self.data.get_unchecked(start..end) }
+    }
+
     pub fn update(&mut self, left: u16, right: u16, value: i16) {
         let index = self.index(left, right);
         self.data.set(index, value);
@@ -83,5 +98,25 @@ impl<'a> ConnectionMatrix<'a> {
     /// Returns maximum number of right connection ID
     pub fn num_right(&self) -> usize {
         self.num_right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn costs_for_right_returns_contiguous_row() {
+        let values = [10i16, 11, 12, 20, 21, 22];
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let matrix = ConnectionMatrix::from_offset_size(&bytes, 0, 3, 2).unwrap();
+
+        assert_eq!(matrix.costs_for_right(0), &[10, 11, 12]);
+        assert_eq!(matrix.costs_for_right(1), &[20, 21, 22]);
+        assert_eq!(matrix.cost(2, 1), 22);
     }
 }

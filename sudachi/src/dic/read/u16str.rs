@@ -25,6 +25,8 @@ pub fn utf16_string_parser(input: &[u8]) -> SudachiNomResult<&[u8], String> {
         } else {
             // most Japanese chars are 3-bytes in utf-8 and 2 in utf-16
             let capacity = (data.len() + 1) * 3 / 2;
+            #[cfg(feature = "profile")]
+            crate::profiling::count_owned_string_allocation();
             let mut result = String::with_capacity(capacity);
             let iter = U16CodeUnits::new(data);
             for c in char::decode_utf16(iter) {

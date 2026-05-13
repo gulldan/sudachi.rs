@@ -17,6 +17,8 @@
 use crate::analysis::created::CreatedWords;
 use crate::analysis::inner::{Node, NodeIdx};
 use crate::analysis::lattice::Lattice;
+#[cfg(feature = "profile")]
+use crate::analysis::node::RightId;
 use crate::analysis::node::{LatticeNode, ResultNode};
 use crate::analysis::stateless_tokenizer::{dump_path, split_path, DictionaryAccess};
 use crate::analysis::Mode;
@@ -176,23 +178,28 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
         self.top_path_ids.reverse();
         for pid in self.top_path_ids.drain(..) {
             let (inner, cost) = self.lattice.node(pid);
-            let wi = if inner.word_id().is_oov() {
+            let word_id = inner.word_id();
+            #[cfg(feature = "profile")]
+            if word_id.is_oov() && !word_id.is_special() {
+                crate::profiling::count_oov_best_path_node();
+            }
+            let wi = if word_id.is_oov() {
                 let curr_slice = self.input.curr_slice_c(inner.char_range()).to_owned();
                 WordInfoData {
-                    pos_id: inner.word_id().word() as u16,
+                    pos_id: word_id.word() as u16,
                     surface: curr_slice,
                     ..Default::default()
                 }
                 .into()
             } else {
-                lex.get_word_info_subset(inner.word_id(), self.subset)?
+                lex.get_word_info_subset(word_id, self.subset)?
             };
 
             let byte_begin = self.input.to_curr_byte_idx(inner.begin());
             let byte_end = self.input.to_curr_byte_idx(inner.end());
 
             path.push(ResultNode::new(
-                inner.clone(),
+                *inner,
                 cost,
                 byte_begin as u16,
                 byte_end as u16,
@@ -263,17 +270,30 @@ impl<'a> LatticeBuilder<'a> {
     fn build_lattice(&mut self) -> SudachiResult<()> {
         self.lattice.reset(self.input.current_chars().len());
         let input_bytes = self.input.current().as_bytes();
+        let oov_needs_buffer_context = self
+            .oov_providers
+            .iter()
+            .any(|provider| provider.needs_oov_buffer_context());
 
         for (ch_off, &byte_off) in self.input.curr_byte_offsets().iter().enumerate() {
             if !self.lattice.has_previous_node(ch_off) {
+                #[cfg(feature = "profile")]
+                crate::profiling::count_token_position_unreachable_skipped();
                 continue;
             }
+            #[cfg(feature = "profile")]
+            crate::profiling::count_token_position_reachable();
 
             self.node_buffer.clear();
             let mut created = CreatedWords::default();
             for e in self.lexicon.lookup(input_bytes, byte_off) {
+                #[cfg(feature = "profile")]
+                crate::profiling::count_candidate_checked();
+
                 // do we really need input.can_bow condition?
                 if (e.end < input_bytes.len()) && !self.input.can_bow(e.end) {
+                    #[cfg(feature = "profile")]
+                    crate::profiling::count_rejected_candidate();
                     continue;
                 }
                 let (left_id, right_id, cost) = self.lexicon.get_word_param(e.word_id);
@@ -287,11 +307,16 @@ impl<'a> LatticeBuilder<'a> {
                     e.word_id,
                 );
                 created = created.add_word((end_c - ch_off) as i64);
-                self.node_buffer.push(node.clone());
+                self.node_buffer.push(node);
                 self.lattice.insert(node, self.matrix);
+                #[cfg(feature = "profile")]
+                crate::profiling::count_lattice_direct_candidate();
             }
 
             // OOV
+            if !oov_needs_buffer_context {
+                self.node_buffer.clear();
+            }
             if !self
                 .input
                 .cat_at_char(ch_off)
@@ -327,12 +352,141 @@ impl<'a> LatticeBuilder<'a> {
         P: OovProviderPlugin + 'a + ?Sized,
     {
         let start_size = self.node_buffer.len();
-        let num_provided = plugin.provide_oov(self.input, char_offset, other, self.node_buffer)?;
-        for idx in start_size..(start_size + num_provided) {
-            let node = self.node_buffer[idx].clone();
-            other = other.add_word(node.char_range().len() as i64);
-            self.lattice.insert(node, self.matrix);
+        #[cfg(feature = "profile")]
+        let provider_kind = plugin.profile_kind();
+        #[cfg(feature = "profile")]
+        crate::profiling::count_oov_provider_call_kind(provider_kind);
+        #[cfg(feature = "profile")]
+        {
+            crate::profiling::count_oov_buffered_provider_call();
+            let cap = self.node_buffer.capacity();
+            crate::profiling::count_oov_temp_buffer_max_len(self.node_buffer.len());
+            let num_provided =
+                plugin.provide_oov(self.input, char_offset, other, self.node_buffer)?;
+            if self.node_buffer.capacity() != cap {
+                crate::profiling::count_oov_temp_buffer_growth();
+            }
+            crate::profiling::count_oov_buffered_candidates(num_provided);
+            crate::profiling::count_oov_candidates_by_provider(provider_kind, num_provided);
+            crate::profiling::count_oov_range(num_provided);
+            crate::profiling::count_oov_temp_buffer_max_len(self.node_buffer.len());
+            crate::profiling::count_oov_duplicate_candidates(count_duplicate_oov_candidates(
+                self.node_buffer,
+                start_size,
+                num_provided,
+            ));
+            count_oov_dominance(self.input, self.node_buffer, start_size, num_provided);
+
+            for idx in start_size..(start_size + num_provided) {
+                let node = self.node_buffer[idx];
+                other = other.add_word(node.char_range().len() as i64);
+                self.lattice.insert(node, self.matrix);
+                crate::profiling::count_lattice_direct_candidate();
+                crate::profiling::count_oov_inserted_node();
+            }
+            return Ok(other);
         }
-        Ok(other)
+
+        #[cfg(not(feature = "profile"))]
+        {
+            let num_provided =
+                plugin.provide_oov(self.input, char_offset, other, self.node_buffer)?;
+
+            for idx in start_size..(start_size + num_provided) {
+                let node = self.node_buffer[idx];
+                other = other.add_word(node.char_range().len() as i64);
+                self.lattice.insert(node, self.matrix);
+            }
+            Ok(other)
+        }
     }
+}
+
+#[cfg(feature = "profile")]
+fn count_duplicate_oov_candidates(nodes: &[Node], start: usize, len: usize) -> usize {
+    let end = start + len;
+    let mut duplicates = 0;
+    for i in start..end {
+        let node = &nodes[i];
+        for prev in &nodes[start..i] {
+            if node.begin() == prev.begin()
+                && node.end() == prev.end()
+                && node.left_id() == prev.left_id()
+                && node.right_id() == prev.right_id()
+                && node.cost() == prev.cost()
+                && node.word_id() == prev.word_id()
+            {
+                duplicates += 1;
+                break;
+            }
+        }
+    }
+    duplicates
+}
+
+#[cfg(feature = "profile")]
+fn count_oov_dominance(input: &InputBuffer, nodes: &[Node], start: usize, len: usize) {
+    let end = start + len;
+    let mut dominated = 0usize;
+
+    for i in start..end {
+        let node = nodes[i];
+        if nodes[start..i]
+            .iter()
+            .any(|prev| same_oov_dominance_key(node, *prev))
+        {
+            continue;
+        }
+
+        let mut group_len = 0usize;
+        let mut min_cost = i16::MAX;
+        for candidate in &nodes[start..end] {
+            if same_oov_dominance_key(node, *candidate) {
+                group_len += 1;
+                min_cost = min_cost.min(candidate.cost());
+            }
+        }
+
+        if group_len > 1 {
+            crate::profiling::count_oov_dominance_group();
+        }
+
+        let mut min_cost_ties = 0usize;
+        for candidate in &nodes[start..end] {
+            if !same_oov_dominance_key(node, *candidate) {
+                continue;
+            }
+
+            if candidate.cost() == min_cost {
+                min_cost_ties += 1;
+            } else {
+                dominated += 1;
+                crate::profiling::count_oov_strict_dominated_candidate(
+                    oov_primary_category(input, candidate.begin()),
+                    candidate.num_codepts(),
+                );
+            }
+        }
+
+        if min_cost_ties > 1 {
+            crate::profiling::count_oov_equal_cost_ties(min_cost_ties - 1);
+        }
+    }
+
+    crate::profiling::count_oov_unique_after_dominance(len - dominated);
+}
+
+#[cfg(feature = "profile")]
+fn same_oov_dominance_key(a: Node, b: Node) -> bool {
+    a.begin() == b.begin()
+        && a.end() == b.end()
+        && a.left_id() == b.left_id()
+        && a.right_id() == b.right_id()
+}
+
+#[cfg(feature = "profile")]
+fn oov_primary_category(input: &InputBuffer, offset: usize) -> CategoryType {
+    let mut category = input.cat_at_char(offset);
+    category.remove(CategoryType::NOOOVBOW | CategoryType::NOOOVBOW2);
+    category.iter().next().unwrap_or(CategoryType::DEFAULT)
 }

@@ -218,6 +218,11 @@ impl MeCabOovPlugin {
             };
 
             if !cinfo.is_invoke && other_words.not_empty() {
+                #[cfg(feature = "profile")]
+                {
+                    crate::profiling::count_oov_suppressed_by_invoke_false();
+                    crate::profiling::count_oov_suppressed_by_has_other_words();
+                }
                 continue;
             }
 
@@ -230,9 +235,14 @@ impl MeCabOovPlugin {
             if cinfo.is_group {
                 for oov in oovs {
                     nodes.push(self.get_oov_node(oov, offset, offset + char_len));
+                    #[cfg(feature = "profile")]
+                    crate::profiling::count_oov_mecab_candidate(ctype, char_len, true);
                     num_created += 1;
                 }
                 llength -= 1;
+            } else if char_len > 1 {
+                #[cfg(feature = "profile")]
+                crate::profiling::count_oov_suppressed_group_by_group_false();
             }
             for i in 1..=cinfo.length {
                 let sublength = input.char_distance(offset, i as usize);
@@ -241,6 +251,8 @@ impl MeCabOovPlugin {
                 }
                 for oov in oovs {
                     nodes.push(self.get_oov_node(oov, offset, offset + sublength));
+                    #[cfg(feature = "profile")]
+                    crate::profiling::count_oov_mecab_candidate(ctype, sublength, false);
                     num_created += 1;
                 }
             }
@@ -250,6 +262,11 @@ impl MeCabOovPlugin {
 }
 
 impl OovProviderPlugin for MeCabOovPlugin {
+    #[cfg(feature = "profile")]
+    fn profile_kind(&self) -> crate::profiling::OovProviderKind {
+        crate::profiling::OovProviderKind::MeCab
+    }
+
     fn set_up(
         &mut self,
         settings: &Value,
@@ -300,6 +317,10 @@ impl OovProviderPlugin for MeCabOovPlugin {
         result: &mut Vec<Node>,
     ) -> SudachiResult<usize> {
         self.provide_oov_gen(input_text, offset, other_words, result)
+    }
+
+    fn needs_oov_buffer_context(&self) -> bool {
+        false
     }
 }
 

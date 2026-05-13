@@ -50,23 +50,31 @@ impl<'a> WordInfos<'a> {
     }
 
     fn parse_word_info(&self, word_id: u32, subset: InfoSubset) -> SudachiResult<WordInfoData> {
+        #[cfg(feature = "profile")]
+        crate::profiling::count_word_info_decode(subset);
+
         let index = self.word_id_to_offset(word_id)?;
         let parser = WordInfoParser::subset(subset);
         parser.parse(&self.bytes[index..])
     }
 
     pub fn get_word_info(&self, word_id: u32, mut subset: InfoSubset) -> SudachiResult<WordInfo> {
+        #[cfg(feature = "profile")]
+        crate::profiling::count_word_info_request();
+
         if !self.has_synonym_group_ids {
             subset -= InfoSubset::SYNONYM_GROUP_ID;
         }
 
         let mut word_info = self.parse_word_info(word_id, subset)?;
 
-        // consult dictionary form
-        let dfwi = word_info.dictionary_form_word_id;
-        if (dfwi >= 0) && (dfwi != word_id as i32) {
-            let inner = self.parse_word_info(dfwi as u32, InfoSubset::SURFACE)?;
-            word_info.dictionary_form = inner.surface;
+        if subset.contains(InfoSubset::DIC_FORM_WORD_ID) {
+            // consult dictionary form
+            let dfwi = word_info.dictionary_form_word_id;
+            if (dfwi >= 0) && (dfwi != word_id as i32) {
+                let inner = self.parse_word_info(dfwi as u32, InfoSubset::SURFACE)?;
+                word_info.dictionary_form = inner.surface;
+            }
         };
 
         Ok(word_info.into())

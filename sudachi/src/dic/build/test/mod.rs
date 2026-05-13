@@ -122,6 +122,12 @@ fn build_system_3words() {
     let mut iter = dic.lexicon().lookup("東京".as_bytes(), 0);
     let entry = iter.next().unwrap();
     assert_eq!(entry.word_id, WordId::new(0, 1));
+    let surface_only = dic
+        .lexicon()
+        .get_word_info_subset(entry.word_id, InfoSubset::SURFACE)
+        .unwrap();
+    assert_eq!(surface_only.surface(), "東");
+    assert_eq!(surface_only.dictionary_form(), "東");
     let entry = iter.next().unwrap();
     assert_eq!(entry.word_id, WordId::new(0, 2));
     assert_eq!(iter.next(), None);

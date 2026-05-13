@@ -29,6 +29,8 @@ pub mod dic;
 pub mod error;
 pub mod input_text;
 pub mod plugin;
+#[cfg(feature = "profile")]
+pub mod profiling;
 pub mod sentence_detector;
 pub mod sentence_splitter;
 pub(crate) mod util;
