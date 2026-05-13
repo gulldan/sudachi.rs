@@ -38,16 +38,31 @@ use crate::prelude::*;
 #[cfg(test)]
 mod test;
 
+const CATEGORY_COUNT: usize = 15;
 const DEFAULT_CHAR_DEF_FILE: &str = "char.def";
 const DEFAULT_CHAR_DEF_BYTES: &[u8] = include_bytes!("../../../../../resources/char.def");
 const DEFAULT_UNK_DEF_FILE: &str = "unk.def";
 const DEFAULT_UNK_DEF_BYTES: &[u8] = include_bytes!("../../../../../resources/unk.def");
 
 /// provides MeCab oov nodes
-#[derive(Default)]
 pub struct MeCabOovPlugin {
     categories: HashMap<CategoryType, CategoryInfo, RoMu>,
     oov_list: HashMap<CategoryType, Vec<Oov>, RoMu>,
+    category_infos: [Option<CategoryInfo>; CATEGORY_COUNT],
+    oov_by_category: [Vec<Oov>; CATEGORY_COUNT],
+    use_precomputed: bool,
+}
+
+impl Default for MeCabOovPlugin {
+    fn default() -> Self {
+        Self {
+            categories: HashMap::with_hasher(RoMu::new()),
+            oov_list: HashMap::with_hasher(RoMu::new()),
+            category_infos: [None; CATEGORY_COUNT],
+            oov_by_category: std::array::from_fn(|_| Vec::new()),
+            use_precomputed: false,
+        }
+    }
 }
 
 /// Struct corresponds with raw config json file.
@@ -187,6 +202,7 @@ impl MeCabOovPlugin {
     }
 
     /// Creates a new oov node
+    #[inline(always)]
     fn get_oov_node(&self, oov: &Oov, start: usize, end: usize) -> Node {
         Node::new(
             start as u16,
@@ -211,10 +227,23 @@ impl MeCabOovPlugin {
         }
         let mut num_created = 0;
 
-        for ctype in input.cat_at_char(offset).iter() {
-            let cinfo = match self.categories.get(&ctype) {
-                Some(ci) => ci,
-                None => continue,
+        let mut category_bits = input.cat_at_char(offset).bits() & ((1u32 << CATEGORY_COUNT) - 1);
+        while category_bits != 0 {
+            let bit = category_bits & category_bits.wrapping_neg();
+            let category_index = bit.trailing_zeros() as usize;
+            let ctype = CategoryType::from_bits_retain(bit);
+            category_bits &= category_bits - 1;
+
+            let cinfo = if self.use_precomputed {
+                match self.category_infos[category_index] {
+                    Some(ci) => ci,
+                    None => continue,
+                }
+            } else {
+                match self.categories.get(&ctype) {
+                    Some(ci) => *ci,
+                    None => continue,
+                }
             };
 
             if !cinfo.is_invoke && other_words.not_empty() {
@@ -227,9 +256,17 @@ impl MeCabOovPlugin {
             }
 
             let mut llength = char_len;
-            let oovs = match self.oov_list.get(&cinfo.category_type) {
-                Some(v) => v,
-                None => continue,
+            let oovs = self.oov_by_category[category_index].as_slice();
+            let oovs = if self.use_precomputed {
+                if oovs.is_empty() {
+                    continue;
+                }
+                oovs
+            } else {
+                match self.oov_list.get(&ctype) {
+                    Some(v) => v.as_slice(),
+                    None => continue,
+                }
             };
 
             if cinfo.is_group {
@@ -303,8 +340,25 @@ impl OovProviderPlugin for MeCabOovPlugin {
             MeCabOovPlugin::read_oov(reader, &categories, grammar, settings.userPOS)?
         };
 
+        let mut category_infos = [None; CATEGORY_COUNT];
+        for (&category, &info) in &categories {
+            if let Some(index) = category_index(category) {
+                category_infos[index] = Some(info);
+            }
+        }
+
+        let mut oov_by_category: [Vec<Oov>; CATEGORY_COUNT] = std::array::from_fn(|_| Vec::new());
+        for (&category, oovs) in &oov_list {
+            if let Some(index) = category_index(category) {
+                oov_by_category[index] = oovs.clone();
+            }
+        }
+
         self.categories = categories;
         self.oov_list = oov_list;
+        self.category_infos = category_infos;
+        self.oov_by_category = oov_by_category;
+        self.use_precomputed = true;
 
         Ok(())
     }
@@ -325,8 +379,9 @@ impl OovProviderPlugin for MeCabOovPlugin {
 }
 
 /// The character category definition
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct CategoryInfo {
+    #[allow(dead_code)]
     category_type: CategoryType,
     is_invoke: bool,
     is_group: bool,
@@ -340,4 +395,18 @@ struct Oov {
     right_id: i16,
     cost: i16,
     pos_id: u16,
+}
+
+#[inline]
+fn category_index(category: CategoryType) -> Option<usize> {
+    let bits = category.bits();
+    if bits == 0 {
+        return None;
+    }
+    let index = bits.trailing_zeros() as usize;
+    if index < CATEGORY_COUNT && bits == (1u32 << index) {
+        Some(index)
+    } else {
+        None
+    }
 }

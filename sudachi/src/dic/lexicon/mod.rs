@@ -130,6 +130,20 @@ impl<'a> Lexicon<'a> {
             })
     }
 
+    #[inline]
+    pub(crate) fn for_each_entry_with_params<F>(&self, input: &[u8], offset: usize, mut f: F)
+    where
+        F: FnMut(WordId, usize, i16, i16, i16),
+    {
+        debug_assert!(self.lex_id < MAX_DICTIONARIES as u8);
+        for entry in self.trie.common_prefix_iterator(input, offset) {
+            for wid in self.word_id_table.entries(entry.value as usize) {
+                let (left_id, right_id, cost) = self.word_params.get_params(wid);
+                f(self.word_id(wid), entry.end, left_id, right_id, cost);
+            }
+        }
+    }
+
     /// Returns WordInfo for given word_id
     ///
     /// WordInfo will contain only fields included in InfoSubset

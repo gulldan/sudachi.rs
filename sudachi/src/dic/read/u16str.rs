@@ -92,14 +92,15 @@ impl Iterator for U16CodeUnits<'_> {
         if self.data.len() <= self.offset {
             return None;
         }
-        let p1 = self.data[self.offset];
-        let p2 = self.data[self.offset + 1];
+        debug_assert!(self.offset + 1 < self.data.len());
+        let ptr = unsafe { self.data.as_ptr().add(self.offset) as *const u16 };
+        let value = unsafe { ptr.read_unaligned() };
         self.offset += 2;
-        Some(u16::from_le_bytes([p1, p2]))
+        Some(u16::from_le(value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.data.len() - self.offset;
+        let rem = (self.data.len() - self.offset) / 2;
         (rem, Some(rem))
     }
 }

@@ -32,6 +32,7 @@ use std::io::Write;
 /// Current implementation has 25% efficiency loss because of padding :(
 /// Maybe we should use array-of-structs layout instead, but I want to try to measure the
 /// efficiency of that without the effects of the current rewrite.
+#[derive(Clone, Copy)]
 struct VNode {
     total_cost: i32,
     right_id: u16,
@@ -83,12 +84,15 @@ pub struct Lattice {
     ends_full: Vec<Vec<Node>>,
     indices: Vec<Vec<NodeIdx>>,
     best_prev_cache: Vec<Vec<BestPrev>>,
+    right_id_min_cost: Vec<i32>,
+    right_id_min_stamp: Vec<u32>,
+    right_id_min_current_stamp: u32,
     eos: Option<(NodeIdx, i32)>,
     size: usize,
 }
 
 impl Lattice {
-    const DIRECT_SCAN_THRESHOLD: usize = 4;
+    const DIRECT_SCAN_THRESHOLD: usize = 8;
 
     fn reset_vec<T>(
         data: &mut Vec<Vec<T>>,
@@ -350,6 +354,196 @@ impl Lattice {
         self.ends.get(i).map(|d| !d.is_empty()).unwrap_or(false)
     }
 
+    pub(crate) fn prune_exact_boundary(
+        &mut self,
+        boundary: usize,
+        conn: &ConnectionMatrix,
+    ) -> usize {
+        if boundary >= self.size {
+            return 0;
+        }
+
+        let len = self.ends[boundary].len();
+        if len == 0 {
+            return 0;
+        }
+
+        if !self.ends[boundary]
+            .iter()
+            .any(|node| node.is_connected_to_bos())
+        {
+            self.clear_boundary(boundary);
+            return len;
+        }
+
+        if len <= Self::DIRECT_SCAN_THRESHOLD {
+            return 0;
+        }
+
+        let stamp = self.next_right_id_stamp(conn.num_left());
+        for node in &self.ends[boundary] {
+            let right_id = node.right_id() as usize;
+            debug_assert!(right_id < self.right_id_min_cost.len());
+            if self.right_id_min_stamp[right_id] != stamp {
+                self.right_id_min_stamp[right_id] = stamp;
+                self.right_id_min_cost[right_id] = node.total_cost();
+            } else {
+                self.right_id_min_cost[right_id] =
+                    self.right_id_min_cost[right_id].min(node.total_cost());
+            }
+        }
+
+        let mut write = 0usize;
+        for read in 0..len {
+            let node = self.ends[boundary][read];
+            let right_id = node.right_id() as usize;
+            let keep = node.total_cost() == self.right_id_min_cost[right_id];
+
+            if keep {
+                if write != read {
+                    self.ends[boundary][write] = self.ends[boundary][read];
+                    self.ends_full[boundary][write] = self.ends_full[boundary][read];
+                    self.indices[boundary][write] = self.indices[boundary][read];
+                }
+                write += 1;
+            }
+        }
+
+        if write == len {
+            return 0;
+        }
+
+        self.ends[boundary].truncate(write);
+        self.ends_full[boundary].truncate(write);
+        self.indices[boundary].truncate(write);
+        self.best_prev_cache[boundary].clear();
+        len - write
+    }
+
+    pub(crate) fn prune_approx_boundary(
+        &mut self,
+        boundary: usize,
+        beam_width: Option<usize>,
+        beam_margin: Option<i32>,
+    ) -> usize {
+        if boundary >= self.size || (beam_width.is_none() && beam_margin.is_none()) {
+            return 0;
+        }
+
+        let len = self.ends[boundary].len();
+        if len <= 1 {
+            return 0;
+        }
+
+        let min_cost = self.ends[boundary]
+            .iter()
+            .map(PathCost::total_cost)
+            .min()
+            .unwrap_or(i32::MAX);
+
+        if min_cost == i32::MAX {
+            self.clear_boundary(boundary);
+            return len;
+        }
+
+        let mut pruned = 0usize;
+        if let Some(margin) = beam_margin {
+            let threshold = min_cost.saturating_add(margin);
+            pruned += self.compact_boundary_by_threshold(boundary, threshold);
+        }
+
+        if let Some(width) = beam_width {
+            let len = self.ends[boundary].len();
+            if len > width {
+                let mut ranked: Vec<_> = (0..len).collect();
+                ranked.sort_unstable_by_key(|&idx| (self.ends[boundary][idx].total_cost(), idx));
+                let mut keep = vec![false; len];
+                for &idx in ranked.iter().take(width) {
+                    keep[idx] = true;
+                }
+                pruned += self.compact_boundary(boundary, &keep);
+            }
+        }
+
+        pruned
+    }
+
+    fn clear_boundary(&mut self, boundary: usize) {
+        self.ends[boundary].clear();
+        self.ends_full[boundary].clear();
+        self.indices[boundary].clear();
+        self.best_prev_cache[boundary].clear();
+    }
+
+    fn compact_boundary(&mut self, boundary: usize, keep: &[bool]) -> usize {
+        let len = self.ends[boundary].len();
+        debug_assert_eq!(len, keep.len());
+
+        let mut write = 0usize;
+        for (read, keep) in keep.iter().copied().enumerate() {
+            if keep {
+                if write != read {
+                    self.ends[boundary][write] = self.ends[boundary][read];
+                    self.ends_full[boundary][write] = self.ends_full[boundary][read];
+                    self.indices[boundary][write] = self.indices[boundary][read];
+                }
+                write += 1;
+            }
+        }
+
+        if write == len {
+            return 0;
+        }
+
+        self.ends[boundary].truncate(write);
+        self.ends_full[boundary].truncate(write);
+        self.indices[boundary].truncate(write);
+        self.best_prev_cache[boundary].clear();
+        len - write
+    }
+
+    fn compact_boundary_by_threshold(&mut self, boundary: usize, threshold: i32) -> usize {
+        let len = self.ends[boundary].len();
+
+        let mut write = 0usize;
+        for read in 0..len {
+            if self.ends[boundary][read].total_cost() <= threshold {
+                if write != read {
+                    self.ends[boundary][write] = self.ends[boundary][read];
+                    self.ends_full[boundary][write] = self.ends_full[boundary][read];
+                    self.indices[boundary][write] = self.indices[boundary][read];
+                }
+                write += 1;
+            }
+        }
+
+        if write == len {
+            return 0;
+        }
+
+        self.ends[boundary].truncate(write);
+        self.ends_full[boundary].truncate(write);
+        self.indices[boundary].truncate(write);
+        self.best_prev_cache[boundary].clear();
+        len - write
+    }
+
+    fn next_right_id_stamp(&mut self, right_id_bound: usize) -> u32 {
+        if self.right_id_min_cost.len() < right_id_bound {
+            self.right_id_min_cost.resize(right_id_bound, i32::MAX);
+            self.right_id_min_stamp.resize(right_id_bound, 0);
+        }
+
+        let next = self.right_id_min_current_stamp.wrapping_add(1);
+        self.right_id_min_current_stamp = if next == 0 {
+            self.right_id_min_stamp.fill(0);
+            1
+        } else {
+            next
+        };
+        self.right_id_min_current_stamp
+    }
+
     /// Lookup a node for the index
     pub fn node(&self, id: NodeIdx) -> (&Node, i32) {
         debug_assert!((id.end() as usize) < self.size);
@@ -492,13 +686,13 @@ mod tests {
         let mut lattice = Lattice::default();
 
         lattice.reset(8);
-        for cost in 1..=5 {
+        for cost in 1..=9 {
             lattice.insert(Node::new(0, 1, 0, 0, cost, WordId::oov(0)), &conn);
         }
         lattice.insert(Node::new(1, 8, 0, 0, 1, WordId::oov(0)), &conn);
 
         assert_eq!(lattice.size, 9);
-        assert_eq!(lattice.ends[1].len(), 5);
+        assert_eq!(lattice.ends[1].len(), 9);
         assert_eq!(lattice.ends_full[8].len(), 1);
         assert_eq!(lattice.indices[8].len(), 1);
         assert_eq!(lattice.best_prev_cache[1].len(), 1);
@@ -514,5 +708,43 @@ mod tests {
         assert!(lattice.ends_full[8].is_empty());
         assert!(lattice.indices[8].is_empty());
         assert!(lattice.best_prev_cache[1].is_empty());
+    }
+
+    #[test]
+    fn exact_boundary_pruning_drops_only_strictly_worse_same_right_id() {
+        let bytes = matrix_bytes(&[0]);
+        let conn = ConnectionMatrix::from_offset_size(&bytes, 0, 1, 1).unwrap();
+        let mut lattice = Lattice::default();
+
+        lattice.reset(2);
+        for cost in [10, 5, 5, 20, 30, 40, 50, 60, 70] {
+            lattice.insert(Node::new(0, 1, 0, 0, cost, WordId::oov(0)), &conn);
+        }
+
+        let pruned = lattice.prune_exact_boundary(1, &conn);
+
+        assert_eq!(pruned, 7);
+        assert_eq!(lattice.ends[1].len(), 2);
+        assert_eq!(lattice.ends[1][0].total_cost(), 5);
+        assert_eq!(lattice.ends[1][1].total_cost(), 5);
+    }
+
+    #[test]
+    fn approximate_boundary_pruning_keeps_stable_top_k_within_margin() {
+        let bytes = matrix_bytes(&[0]);
+        let conn = ConnectionMatrix::from_offset_size(&bytes, 0, 1, 1).unwrap();
+        let mut lattice = Lattice::default();
+
+        lattice.reset(2);
+        for cost in [10, 5, 7, 6] {
+            lattice.insert(Node::new(0, 1, 0, 0, cost, WordId::oov(0)), &conn);
+        }
+
+        let pruned = lattice.prune_approx_boundary(1, Some(2), Some(10));
+
+        assert_eq!(pruned, 2);
+        assert_eq!(lattice.ends[1].len(), 2);
+        assert_eq!(lattice.ends[1][0].total_cost(), 5);
+        assert_eq!(lattice.ends[1][1].total_cost(), 6);
     }
 }

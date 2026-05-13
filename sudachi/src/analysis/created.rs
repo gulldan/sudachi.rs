@@ -58,6 +58,15 @@ impl CreatedWords {
         self.add(mask)
     }
 
+    #[inline(always)]
+    #[must_use]
+    pub fn add_word_usize(&self, length: usize) -> CreatedWords {
+        debug_assert!(length > 0);
+        let raw = length as Carrier;
+        let shift = min(raw.saturating_sub(1), CreatedWords::MAX_SHIFT);
+        CreatedWords(self.0 | ((1 as Carrier) << shift))
+    }
+
     #[must_use]
     pub fn add(&self, other: CreatedWords) -> CreatedWords {
         CreatedWords(self.0 | other.0)

@@ -44,9 +44,14 @@ impl<'a> WordParams<'a> {
     #[inline]
     pub fn get_params(&self, word_id: u32) -> (i16, i16, i16) {
         let begin = word_id as usize * Self::PARAM_SIZE;
-        let end = begin + Self::PARAM_SIZE;
-        let slice = &self.data[begin..end];
-        (slice[0], slice[1], slice[2])
+        debug_assert!(begin + Self::PARAM_SIZE <= self.data.len());
+        unsafe {
+            (
+                *self.data.get_unchecked(begin),
+                *self.data.get_unchecked(begin + 1),
+                *self.data.get_unchecked(begin + 2),
+            )
+        }
     }
 
     pub fn get_cost(&self, word_id: u32) -> i16 {

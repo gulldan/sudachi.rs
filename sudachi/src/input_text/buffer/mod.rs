@@ -67,7 +67,7 @@ pub struct InputBuffer {
     /// Byte-to-char mapping for the modified string. Byte-based indexing.
     mod_b2c: Vec<usize>,
     /// Markers whether the byte can start new word or not
-    mod_bow: Vec<bool>,
+    mod_bow: Vec<u8>,
     /// Character categories. Char-based indexing.
     mod_cat: Vec<CategoryType>,
     /// Number of codepoints with the same category. Char-based indexing.
@@ -138,7 +138,7 @@ impl InputBuffer {
         // Special cases for BOW logic
         let non_starting = CategoryType::ALPHA | CategoryType::GREEK | CategoryType::CYRILLIC;
         let mut prev_cat = CategoryType::empty();
-        self.mod_bow.resize(self.modified.len(), false);
+        self.mod_bow.resize(self.modified.len(), 0);
         let mut next_bow = true;
 
         for (chidx, (bidx, ch)) in self.modified.char_indices().enumerate() {
@@ -170,7 +170,7 @@ impl InputBuffer {
                 true
             };
 
-            self.mod_bow[bidx] = can_bow;
+            self.mod_bow[bidx] = u8::from(can_bow);
             prev_cat = cat;
         }
         // trailing indices for the last codepoint
@@ -358,9 +358,11 @@ impl InputBuffer {
         &self.original[start..end]
     }
 
+    #[inline(always)]
     pub fn ch_idx(&self, idx: usize) -> usize {
         debug_assert_eq!(self.state, BufferState::RO);
-        self.mod_b2c[idx]
+        debug_assert!(idx < self.mod_b2c.len());
+        unsafe { *self.mod_b2c.get_unchecked(idx) }
     }
 
     /// Swaps original data with the passed location
@@ -376,10 +378,11 @@ impl InputBuffer {
 
     /// Whether the byte can start a new word.
     /// Supports bytes not on character boundaries.
-    #[inline]
+    #[inline(always)]
     pub fn can_bow(&self, offset: usize) -> bool {
         debug_assert_eq!(self.state, BufferState::RO);
-        self.mod_bow[offset]
+        debug_assert!(offset < self.mod_bow.len());
+        unsafe { *self.mod_bow.get_unchecked(offset) != 0 }
     }
 
     /// Returns char length to the next can_bow point
@@ -412,16 +415,18 @@ impl InputTextIndex for InputBuffer {
             .fold(CategoryType::all(), |a, b| a & *b)
     }
 
-    #[inline]
+    #[inline(always)]
     fn cat_at_char(&self, offset: usize) -> CategoryType {
         debug_assert_eq!(self.state, BufferState::RO);
-        self.mod_cat[offset]
+        debug_assert!(offset < self.mod_cat.len());
+        unsafe { *self.mod_cat.get_unchecked(offset) }
     }
 
-    #[inline]
+    #[inline(always)]
     fn cat_continuous_len(&self, offset: usize) -> usize {
         debug_assert_eq!(self.state, BufferState::RO);
-        self.mod_cat_continuity[offset]
+        debug_assert!(offset < self.mod_cat_continuity.len());
+        unsafe { *self.mod_cat_continuity.get_unchecked(offset) }
     }
 
     fn char_distance(&self, cpt: usize, offset: usize) -> usize {

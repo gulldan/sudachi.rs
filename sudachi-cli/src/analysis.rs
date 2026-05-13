@@ -16,7 +16,7 @@
 
 use super::output::{SudachiOutput, Writer};
 use std::io::Write;
-use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
+use sudachi::analysis::stateful_tokenizer::{StatefulTokenizer, TokenizerOptimization};
 use sudachi::analysis::stateless_tokenizer::DictionaryAccess;
 use sudachi::analysis::Mode;
 use sudachi::dic::subset::InfoSubset;
@@ -25,7 +25,6 @@ use sudachi::sentence_splitter::{SentenceSplitter, SplitSentences};
 
 pub trait Analysis {
     fn analyze(&mut self, input: &str, writer: &mut Writer);
-    fn set_subset(&mut self, subset: InfoSubset);
 }
 
 pub struct SplitSentencesOnly<'a> {
@@ -45,10 +44,6 @@ impl<'a> Analysis for SplitSentencesOnly<'a> {
             writer.write_all(sent.as_bytes()).expect("write failed")
         }
     }
-
-    fn set_subset(&mut self, _subset: InfoSubset) {
-        //noop
-    }
 }
 
 pub struct AnalyzeNonSplitted<D: DictionaryAccess, O: SudachiOutput<D>> {
@@ -59,12 +54,41 @@ pub struct AnalyzeNonSplitted<D: DictionaryAccess, O: SudachiOutput<D>> {
 
 impl<D: DictionaryAccess + Clone, O: SudachiOutput<D>> AnalyzeNonSplitted<D, O> {
     pub fn new(output: O, dict: D, mode: Mode, enable_debug: bool) -> Self {
+        Self::new_with_optimization(
+            output,
+            dict,
+            mode,
+            enable_debug,
+            TokenizerOptimization::default(),
+        )
+    }
+
+    pub fn new_with_optimization(
+        output: O,
+        dict: D,
+        mode: Mode,
+        enable_debug: bool,
+        optimization: TokenizerOptimization,
+    ) -> Self {
+        let subset = output.subset() | required_rewrite_subset(&dict);
+        let mut analyzer = StatefulTokenizer::create(dict.clone(), enable_debug, mode);
+        analyzer.set_subset(subset);
+        analyzer.set_optimization(optimization);
+
         Self {
             output,
-            morphemes: MorphemeList::empty(dict.clone()),
-            analyzer: StatefulTokenizer::create(dict, enable_debug, mode),
+            morphemes: MorphemeList::empty(dict),
+            analyzer,
         }
     }
+}
+
+fn required_rewrite_subset<D: DictionaryAccess>(dict: &D) -> InfoSubset {
+    dict.path_rewrite_plugins()
+        .iter()
+        .fold(InfoSubset::empty(), |subset, plugin| {
+            subset | plugin.required_subset()
+        })
 }
 
 impl<D: DictionaryAccess, O: SudachiOutput<D>> Analysis for AnalyzeNonSplitted<D, O> {
@@ -80,10 +104,6 @@ impl<D: DictionaryAccess, O: SudachiOutput<D>> Analysis for AnalyzeNonSplitted<D
             .write(writer, &self.morphemes)
             .expect("write result failed");
     }
-
-    fn set_subset(&mut self, subset: InfoSubset) {
-        self.analyzer.set_subset(subset);
-    }
 }
 
 pub struct AnalyzeSplitted<'a, D: DictionaryAccess + 'a, O: SudachiOutput<&'a D>> {
@@ -93,8 +113,30 @@ pub struct AnalyzeSplitted<'a, D: DictionaryAccess + 'a, O: SudachiOutput<&'a D>
 
 impl<'a, D: DictionaryAccess + 'a, O: SudachiOutput<&'a D>> AnalyzeSplitted<'a, D, O> {
     pub fn new(output: O, dict: &'a D, mode: Mode, enable_debug: bool) -> Self {
+        Self::new_with_optimization(
+            output,
+            dict,
+            mode,
+            enable_debug,
+            TokenizerOptimization::default(),
+        )
+    }
+
+    pub fn new_with_optimization(
+        output: O,
+        dict: &'a D,
+        mode: Mode,
+        enable_debug: bool,
+        optimization: TokenizerOptimization,
+    ) -> Self {
         Self {
-            inner: AnalyzeNonSplitted::new(output, dict, mode, enable_debug),
+            inner: AnalyzeNonSplitted::new_with_optimization(
+                output,
+                dict,
+                mode,
+                enable_debug,
+                optimization,
+            ),
             splitter: SentenceSplitter::new().with_checker(dict.lexicon()),
         }
     }
@@ -105,9 +147,5 @@ impl<'a, D: DictionaryAccess + 'a, O: SudachiOutput<&'a D>> Analysis for Analyze
         for (_, sent) in self.splitter.split(input) {
             self.inner.analyze(sent, writer);
         }
-    }
-
-    fn set_subset(&mut self, subset: InfoSubset) {
-        self.inner.set_subset(subset)
     }
 }

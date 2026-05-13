@@ -23,6 +23,7 @@ use crate::analysis::lattice::Lattice;
 use crate::analysis::node::ResultNode;
 use crate::config::Config;
 use crate::dic::grammar::Grammar;
+use crate::dic::subset::InfoSubset;
 use crate::input_text::InputBuffer;
 use crate::plugin::path_rewrite::join_katakana_oov::JoinKatakanaOovPlugin;
 use crate::plugin::path_rewrite::join_numeric::JoinNumericPlugin;
@@ -42,6 +43,14 @@ pub trait PathRewritePlugin: Sync + Send {
         path: Vec<ResultNode>,
         lattice: &Lattice,
     ) -> SudachiResult<Vec<ResultNode>>;
+
+    /// Returns WordInfo fields required for rewriting the path.
+    ///
+    /// Unknown external plugins keep the historical all-fields behavior unless
+    /// they opt in to a narrower subset.
+    fn required_subset(&self) -> InfoSubset {
+        InfoSubset::all()
+    }
 }
 
 impl PluginCategory for dyn PathRewritePlugin {

@@ -98,6 +98,16 @@ impl LexiconSet<'_> {
             .flat_map(move |l| l.lookup(input, offset))
     }
 
+    #[inline]
+    pub(crate) fn for_each_entry_with_params<F>(&self, input: &[u8], offset: usize, mut f: F)
+    where
+        F: FnMut(WordId, usize, i16, i16, i16),
+    {
+        for lexicon in self.lexicons.iter().rev() {
+            lexicon.for_each_entry_with_params(input, offset, &mut f);
+        }
+    }
+
     /// Returns WordInfo for given WordId
     pub fn get_word_info(&self, id: WordId) -> SudachiResult<WordInfo> {
         self.get_word_info_subset(id, InfoSubset::all())

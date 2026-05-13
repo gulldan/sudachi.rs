@@ -33,16 +33,37 @@ use crate::input_text::InputTextIndex;
 use crate::plugin::oov::OovProviderPlugin;
 use crate::prelude::MorphemeList;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenizerOptimization {
+    pub exact_right_id_pruning: bool,
+    pub beam_width: Option<usize>,
+    pub beam_margin: Option<i32>,
+    pub oov_limit: Option<usize>,
+}
+
+impl Default for TokenizerOptimization {
+    fn default() -> Self {
+        Self {
+            exact_right_id_pruning: false,
+            beam_width: None,
+            beam_margin: None,
+            oov_limit: None,
+        }
+    }
+}
+
 pub struct StatefulTokenizer<D> {
     dictionary: D,
     input: InputBuffer,
     debug: bool,
     mode: Mode,
     oov: Vec<Node>,
+    oov_needs_buffer_context: bool,
     lattice: Lattice,
     top_path_ids: Vec<NodeIdx>,
     top_path: Option<Vec<ResultNode>>,
     subset: InfoSubset,
+    optimization: TokenizerOptimization,
 }
 
 impl<D: DictionaryAccess + Clone> StatefulTokenizer<D> {
@@ -60,16 +81,22 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
 
     /// Create a new debug stateful tokenizer with the following options
     pub fn create(dic: D, debug: bool, mode: Mode) -> Self {
+        let oov_needs_buffer_context = dic
+            .oov_provider_plugins()
+            .iter()
+            .any(|provider| provider.needs_oov_buffer_context());
         Self {
             dictionary: dic,
             input: InputBuffer::default(),
             debug,
             mode,
             oov: Vec::with_capacity(10),
+            oov_needs_buffer_context,
             lattice: Lattice::default(),
             top_path_ids: Vec::new(),
             top_path: Some(Vec::new()),
             subset: InfoSubset::all(),
+            optimization: TokenizerOptimization::default(),
         }
     }
 
@@ -102,6 +129,13 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
         };
         let new_subset = (subset | mode_subset).normalize();
         std::mem::replace(&mut self.subset, new_subset | mode_subset)
+    }
+
+    pub fn set_optimization(
+        &mut self,
+        optimization: TokenizerOptimization,
+    ) -> TokenizerOptimization {
+        std::mem::replace(&mut self.optimization, optimization)
     }
 
     /// Prepare StatefulTokenizer for the next data.
@@ -175,8 +209,7 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
         let lex = self.dictionary.lexicon();
         let mut path = self.top_path.take().unwrap_or_default();
         self.lattice.fill_top_path(&mut self.top_path_ids);
-        self.top_path_ids.reverse();
-        for pid in self.top_path_ids.drain(..) {
+        for &pid in self.top_path_ids.iter().rev() {
             let (inner, cost) = self.lattice.node(pid);
             let word_id = inner.word_id();
             #[cfg(feature = "profile")]
@@ -206,6 +239,7 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
                 wi,
             ));
         }
+        self.top_path_ids.clear();
         Ok(path)
     }
 
@@ -236,6 +270,9 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
             oov_providers: self.dictionary.oov_provider_plugins(),
             lexicon: self.dictionary.lexicon(),
             input: &self.input,
+            oov_needs_buffer_context: self.oov_needs_buffer_context,
+            optimization: self.optimization,
+            debug: self.debug,
         };
         builder.build_lattice()
     }
@@ -263,6 +300,9 @@ struct LatticeBuilder<'a> {
     input: &'a InputBuffer,
     lexicon: &'a LexiconSet<'a>,
     oov_providers: &'a [Box<dyn OovProviderPlugin + Sync + Send>],
+    oov_needs_buffer_context: bool,
+    optimization: TokenizerOptimization,
+    debug: bool,
 }
 
 impl<'a> LatticeBuilder<'a> {
@@ -270,12 +310,18 @@ impl<'a> LatticeBuilder<'a> {
     fn build_lattice(&mut self) -> SudachiResult<()> {
         self.lattice.reset(self.input.current_chars().len());
         let input_bytes = self.input.current().as_bytes();
-        let oov_needs_buffer_context = self
-            .oov_providers
-            .iter()
-            .any(|provider| provider.needs_oov_buffer_context());
+        let oov_needs_buffer_context = self.oov_needs_buffer_context;
 
         for (ch_off, &byte_off) in self.input.curr_byte_offsets().iter().enumerate() {
+            if self.optimization.exact_right_id_pruning && !self.debug {
+                self.lattice.prune_exact_boundary(ch_off, self.matrix);
+            }
+            self.lattice.prune_approx_boundary(
+                ch_off,
+                self.optimization.beam_width,
+                self.optimization.beam_margin,
+            );
+
             if !self.lattice.has_previous_node(ch_off) {
                 #[cfg(feature = "profile")]
                 crate::profiling::count_token_position_unreachable_skipped();
@@ -286,32 +332,37 @@ impl<'a> LatticeBuilder<'a> {
 
             self.node_buffer.clear();
             let mut created = CreatedWords::default();
-            for e in self.lexicon.lookup(input_bytes, byte_off) {
-                #[cfg(feature = "profile")]
-                crate::profiling::count_candidate_checked();
-
-                // do we really need input.can_bow condition?
-                if (e.end < input_bytes.len()) && !self.input.can_bow(e.end) {
+            self.lexicon.for_each_entry_with_params(
+                input_bytes,
+                byte_off,
+                |word_id, end, left_id, right_id, cost| {
                     #[cfg(feature = "profile")]
-                    crate::profiling::count_rejected_candidate();
-                    continue;
-                }
-                let (left_id, right_id, cost) = self.lexicon.get_word_param(e.word_id);
-                let end_c = self.input.ch_idx(e.end);
-                let node = Node::new(
-                    ch_off as u16,
-                    end_c as u16,
-                    left_id as u16,
-                    right_id as u16,
-                    cost,
-                    e.word_id,
-                );
-                created = created.add_word((end_c - ch_off) as i64);
-                self.node_buffer.push(node);
-                self.lattice.insert(node, self.matrix);
-                #[cfg(feature = "profile")]
-                crate::profiling::count_lattice_direct_candidate();
-            }
+                    crate::profiling::count_candidate_checked();
+
+                    // do we really need input.can_bow condition?
+                    if (end < input_bytes.len()) && !self.input.can_bow(end) {
+                        #[cfg(feature = "profile")]
+                        crate::profiling::count_rejected_candidate();
+                        return;
+                    }
+                    let end_c = self.input.ch_idx(end);
+                    let node = Node::new(
+                        ch_off as u16,
+                        end_c as u16,
+                        left_id as u16,
+                        right_id as u16,
+                        cost,
+                        word_id,
+                    );
+                    created = created.add_word_usize(end_c - ch_off);
+                    if oov_needs_buffer_context {
+                        self.node_buffer.push(node);
+                    }
+                    self.lattice.insert(node, self.matrix);
+                    #[cfg(feature = "profile")]
+                    crate::profiling::count_lattice_direct_candidate();
+                },
+            );
 
             // OOV
             if !oov_needs_buffer_context {
@@ -336,6 +387,15 @@ impl<'a> LatticeBuilder<'a> {
                 return Err(SudachiError::EosBosDisconnect);
             }
         }
+        let eos_boundary = self.input.current_chars().len();
+        if self.optimization.exact_right_id_pruning && !self.debug {
+            self.lattice.prune_exact_boundary(eos_boundary, self.matrix);
+        }
+        self.lattice.prune_approx_boundary(
+            eos_boundary,
+            self.optimization.beam_width,
+            self.optimization.beam_margin,
+        );
         self.lattice.connect_eos(self.matrix)?;
 
         Ok(())
@@ -377,13 +437,15 @@ impl<'a> LatticeBuilder<'a> {
             ));
             count_oov_dominance(self.input, self.node_buffer, start_size, num_provided);
 
-            for idx in start_size..(start_size + num_provided) {
+            let num_inserted = self.limit_oov_candidates(num_provided);
+            for idx in start_size..(start_size + num_inserted) {
                 let node = self.node_buffer[idx];
-                other = other.add_word(node.char_range().len() as i64);
+                other = other.add_word_usize(node.char_range().len());
                 self.lattice.insert(node, self.matrix);
                 crate::profiling::count_lattice_direct_candidate();
                 crate::profiling::count_oov_inserted_node();
             }
+            self.node_buffer.truncate(start_size + num_inserted);
             return Ok(other);
         }
 
@@ -392,12 +454,22 @@ impl<'a> LatticeBuilder<'a> {
             let num_provided =
                 plugin.provide_oov(self.input, char_offset, other, self.node_buffer)?;
 
-            for idx in start_size..(start_size + num_provided) {
+            let num_inserted = self.limit_oov_candidates(num_provided);
+            for idx in start_size..(start_size + num_inserted) {
                 let node = self.node_buffer[idx];
-                other = other.add_word(node.char_range().len() as i64);
+                other = other.add_word_usize(node.char_range().len());
                 self.lattice.insert(node, self.matrix);
             }
+            self.node_buffer.truncate(start_size + num_inserted);
             Ok(other)
+        }
+    }
+
+    #[inline]
+    fn limit_oov_candidates(&self, num_provided: usize) -> usize {
+        match self.optimization.oov_limit {
+            Some(limit) => num_provided.min(limit),
+            None => num_provided,
         }
     }
 }

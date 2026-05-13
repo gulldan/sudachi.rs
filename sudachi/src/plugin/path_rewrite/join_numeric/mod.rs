@@ -23,6 +23,7 @@ use crate::analysis::node::{concat_nodes, LatticeNode, ResultNode};
 use crate::config::Config;
 use crate::dic::category_type::CategoryType;
 use crate::dic::grammar::Grammar;
+use crate::dic::subset::InfoSubset;
 use crate::input_text::InputBuffer;
 use crate::input_text::InputTextIndex;
 use crate::plugin::path_rewrite::PathRewritePlugin;
@@ -198,5 +199,12 @@ impl PathRewritePlugin for JoinNumericPlugin {
         _lattice: &Lattice,
     ) -> SudachiResult<Vec<ResultNode>> {
         self.rewrite_gen(text, path)
+    }
+
+    fn required_subset(&self) -> InfoSubset {
+        InfoSubset::SURFACE
+            | InfoSubset::HEAD_WORD_LENGTH
+            | InfoSubset::POS_ID
+            | InfoSubset::NORMALIZED_FORM
     }
 }

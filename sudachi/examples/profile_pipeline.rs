@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
+use sudachi::analysis::stateful_tokenizer::{StatefulTokenizer, TokenizerOptimization};
 use sudachi::analysis::Mode;
 use sudachi::config::Config;
 use sudachi::dic::dictionary::JapaneseDictionary;
@@ -216,6 +216,7 @@ struct Args {
     accessors: AccessorPlan,
     subset: InfoSubset,
     skip_errors: bool,
+    optimization: TokenizerOptimization,
 }
 
 #[derive(Clone, Default)]
@@ -273,6 +274,7 @@ fn main() {
             args.accessors,
             args.subset,
             args.skip_errors,
+            args.optimization,
         ));
     }
     let trace = total_trace.average(args.iterations);
@@ -289,6 +291,22 @@ fn main() {
     println!("accessors\t{}", args.accessors.label());
     println!("subset\t{}", format_subset(args.subset));
     println!("skip_errors\t{}", args.skip_errors);
+    println!(
+        "exact_right_id_pruning\t{}",
+        args.optimization.exact_right_id_pruning
+    );
+    println!(
+        "beam_width\t{}",
+        format_option_usize(args.optimization.beam_width)
+    );
+    println!(
+        "beam_margin\t{}",
+        format_option_i32(args.optimization.beam_margin)
+    );
+    println!(
+        "fast_oov_limit\t{}",
+        format_option_usize(args.optimization.oov_limit)
+    );
     println!("sentences_per_iter\t{}", trace.sentences);
     println!("morphemes_per_iter\t{}", trace.morphemes);
     println!("errors_per_iter\t{}", trace.errors);
@@ -315,10 +333,12 @@ fn run_pipeline(
     accessors: AccessorPlan,
     subset: InfoSubset,
     skip_errors: bool,
+    optimization: TokenizerOptimization,
 ) -> Trace {
     let splitter = SentenceSplitter::new().with_checker(dict.lexicon());
     let mut analyzer = StatefulTokenizer::create(dict, false, mode);
     analyzer.set_subset(subset);
+    analyzer.set_optimization(optimization);
     let mut result = MorphemeList::empty(dict);
     let mut trace = Trace {
         lines: corpus.len(),
@@ -955,6 +975,7 @@ fn parse_args() -> Result<Args, String> {
         accessors: AccessorPlan::All,
         subset: InfoSubset::all(),
         skip_errors: false,
+        optimization: TokenizerOptimization::default(),
     };
 
     let mut iter = env::args().skip(1);
@@ -1008,6 +1029,37 @@ fn parse_args() -> Result<Args, String> {
                 args.subset = parse_subset(&value)?;
             }
             "--skip-errors" => args.skip_errors = true,
+            "--exact-prune" => args.optimization.exact_right_id_pruning = true,
+            "--beam-width" => {
+                let value = value_string(&mut iter, &arg)?;
+                let width = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --beam-width value: {value}"))?;
+                if width == 0 {
+                    return Err("--beam-width must be greater than zero".to_owned());
+                }
+                args.optimization.beam_width = Some(width);
+            }
+            "--beam-margin" => {
+                let value = value_string(&mut iter, &arg)?;
+                let margin = value
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid --beam-margin value: {value}"))?;
+                if margin < 0 {
+                    return Err("--beam-margin must be zero or greater".to_owned());
+                }
+                args.optimization.beam_margin = Some(margin);
+            }
+            "--fast-oov-limit" => {
+                let value = value_string(&mut iter, &arg)?;
+                let limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --fast-oov-limit value: {value}"))?;
+                if limit == 0 {
+                    return Err("--fast-oov-limit must be greater than zero".to_owned());
+                }
+                args.optimization.oov_limit = Some(limit);
+            }
             "--help" | "-h" => usage_and_exit(),
             _ => return Err(format!("unknown argument: {arg}")),
         }
@@ -1091,6 +1143,18 @@ fn format_subset(subset: InfoSubset) -> String {
     parts.join(",")
 }
 
+fn format_option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn format_option_i32(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
 fn value_path(iter: &mut impl Iterator<Item = String>, arg: &str) -> Result<PathBuf, String> {
     value_string(iter, arg).map(PathBuf::from)
 }
@@ -1112,7 +1176,8 @@ fn usage_and_exit() -> ! {
          [--config PATH] [--resource-dir PATH] [--dict PATH] [--input PATH] \\
          [--corpus NAME] [--repeat N] [--mode A|B|C] [--iterations N] \\
          [--split-sentences yes|no] [--accessors none|surface|pos|normalized|dictionary|reading|word-info|splits|all] \\
-         [--subset all|none|rewrite-min|FIELD[,FIELD...]] [--skip-errors]"
+         [--subset all|none|rewrite-min|FIELD[,FIELD...]] [--skip-errors] \\
+         [--exact-prune] [--beam-width N] [--beam-margin COST] [--fast-oov-limit N]"
     );
     std::process::exit(2);
 }
