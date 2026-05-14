@@ -358,18 +358,18 @@ $ sudachipy -r path/to/sudachi.json
 
 #### Install sdist via pip
 
-1. Install python module `setuptools` and `setuptools-rust`.
+1. Install python modules `build` and `tomlkit`.
 2. Run `./build-sdist.sh` in `python` dir.
    - source distribution will be generated under `python/dist/` dir.
 3. Install it via pip: `pip install ./python/dist/SudachiPy-[version].tar.gz`
 
 #### Install develop build
 
-1. Install python module `setuptools` and `setuptools-rust`.
+1. Install python module `maturin`.
 2. Run `python3 -m pip install -e .` to install sudachipy (editable install).
 3. Now you can import the module by `import sudachipy`.
 
-ref: [setuptools-rust](https://github.com/PyO3/setuptools-rust)
+ref: [maturin](https://github.com/PyO3/maturin)
 
 ### Test
 

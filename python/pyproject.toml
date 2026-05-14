@@ -1,5 +1,29 @@
 [build-system]
-requires = ["setuptools", "wheel", "setuptools-rust"]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "SudachiPy"
+version = "0.6.12-a1"
+description = "Python version of Sudachi, the Japanese Morphological Analyzer"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [{ name = "Works Applications", email = "sudachi@worksap.co.jp" }]
+
+[project.optional-dependencies]
+tests = ["tokenizers", "sudachidict_core"]
+
+[project.scripts]
+sudachipy = "sudachipy.command_line:main"
+
+[project.urls]
+Homepage = "https://github.com/WorksApplications/sudachi.rs/tree/develop/python"
+Repository = "https://github.com/WorksApplications/sudachi.rs"
+
+[tool.maturin]
+python-source = "py_src"
+module-name = "sudachipy.sudachipy"
 
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp313t-* cp314-* cp314t-*"

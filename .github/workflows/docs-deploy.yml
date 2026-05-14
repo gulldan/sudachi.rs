@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: python3 -m pip install -U setuptools setuptools-rust sphinx sphinx-rtd-theme
+        run: python3 -m pip install -U maturin sphinx sphinx-rtd-theme
 
       - name: Build python binding
         working-directory: ./python
