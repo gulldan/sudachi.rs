@@ -16,7 +16,7 @@
 
 use std::iter::FusedIterator;
 
-use crate::dic::read::varint::varint32;
+use crate::dic::read::varint::decode_varint32;
 use crate::dic::word_id::EntryId;
 
 pub struct WordIdTable<'a> {
@@ -54,10 +54,10 @@ pub struct DeltaCompressedEntryIdIter<'a> {
 
 impl<'a> DeltaCompressedEntryIdIter<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        let (rest, remining) = varint32(bytes).expect("Failed to parse length in WordIdTable");
+        let (remining, consumed) = decode_varint32(bytes);
 
         DeltaCompressedEntryIdIter {
-            rest,
+            rest: &bytes[consumed..],
             remining,
             sum: 0,
         }
@@ -73,9 +73,9 @@ impl Iterator for DeltaCompressedEntryIdIter<'_> {
             return None;
         }
 
-        let (rest, delta) = varint32(self.rest).expect("Failed to parse next word id delta");
+        let (delta, consumed) = decode_varint32(self.rest);
 
-        self.rest = rest;
+        self.rest = &self.rest[consumed..];
         self.remining -= 1;
         self.sum += delta;
         Some(EntryId::new(self.sum))

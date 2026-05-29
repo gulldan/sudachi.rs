@@ -104,3 +104,91 @@ pub fn varint32(input: &[u8]) -> SudachiNomResult<&[u8], u32> {
         Ok((rest, v as u32))
     }
 }
+
+/// Branch-light LEB128 decode of a `u32`, returning `(value, bytes_consumed)`.
+///
+/// This is the hot-loop counterpart of [`varint32`] used by the word-id table
+/// iterator: it reads the slice directly (no per-byte `Result` threading and no
+/// `u64` widening) with a single-byte fast path, which is the common case for
+/// delta-compressed entry ids. It trusts the (builder-produced) dictionary
+/// bytes the same way the rest of the readers do; a truncated buffer panics on
+/// the bounds check rather than invoking UB.
+#[inline(always)]
+pub fn decode_varint32(data: &[u8]) -> (u32, usize) {
+    let b0 = data[0];
+    if b0 < 0x80 {
+        return (b0 as u32, 1);
+    }
+    let mut result = (b0 & 0x7f) as u32;
+    let mut shift = 7u32;
+    let mut i = 1usize;
+    loop {
+        let b = data[i];
+        i += 1;
+        result |= ((b & 0x7f) as u32) << shift;
+        if b < 0x80 {
+            return (result, i);
+        }
+        shift += 7;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_varint32, varint32};
+
+    fn encode(mut v: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decode_varint32_matches_nom_decoder() {
+        let cases = [
+            0u32,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            0x1f_ffff,
+            0x20_0000,
+            0x0fff_ffff,
+            0x1000_0000,
+            12345,
+            65535,
+            70000,
+            u32::MAX,
+        ];
+        for &v in &cases {
+            let enc = encode(v);
+            let (val, consumed) = decode_varint32(&enc);
+            assert_eq!(val, v, "decoded value for {v}");
+            assert_eq!(consumed, enc.len(), "consumed bytes for {v}");
+            let (rest, nom_val) = varint32(&enc).expect("nom decode");
+            assert_eq!(nom_val, v, "nom value for {v}");
+            assert!(rest.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_varint32_consumes_only_its_own_bytes() {
+        let mut enc = encode(300);
+        let len = enc.len();
+        enc.extend_from_slice(&[0xAA, 0xBB]); // trailing bytes must be untouched
+        let (val, consumed) = decode_varint32(&enc);
+        assert_eq!(val, 300);
+        assert_eq!(consumed, len);
+    }
+}
