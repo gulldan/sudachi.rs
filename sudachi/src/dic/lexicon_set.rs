@@ -21,8 +21,10 @@ use crate::dic::lexicon::strings::StringPointer;
 use crate::dic::lexicon::{Lexicon, LexiconEntry, MAX_DICTIONARIES};
 use crate::dic::subset::InfoSubset;
 use crate::dic::word_id::{DictId, WordId};
-use crate::dic::word_info::{WordInfo, WordInfoEntryIdCursor};
+use crate::dic::strings_cache::StringsCache;
+use crate::dic::word_info::{WordInfo, WordInfoData, WordInfoEntryIdCursor};
 use crate::dic::LexiconAccess;
+use std::sync::Arc;
 use crate::prelude::*;
 
 /// Sudachi error
@@ -178,23 +180,32 @@ impl LexiconSet<'_> {
         self.get_word_info_subset(id, InfoSubset::all())
     }
 
-    /// Returns WordInfo for given WordId.
-    /// Only fills a requested subset of fields.
-    /// Rest will be of default values (0 or empty).
-    pub fn get_word_info_subset(&self, id: WordId, subset: InfoSubset) -> SudachiResult<WordInfo> {
+    /// Resolves the [`WordInfoData`] for a word id and subset, without wrapping it
+    /// in a [`WordInfo`]. The tokenizer-local `WordInfoCache` uses this so it can
+    /// share the resolved data (and a fresh strings cache) behind `Arc`.
+    pub(crate) fn get_word_info_data_subset(
+        &self,
+        id: WordId,
+        subset: InfoSubset,
+    ) -> SudachiResult<WordInfoData> {
         let dict_id = id.dict();
         let lexicon = self
             .lexicons
             .get(dict_id.as_raw() as usize)
             .ok_or(SudachiError::InvalidWordId(id))?;
-        let word_info_data = lexicon.get_word_info(id.entry(), subset)?.resolve(
+        Ok(lexicon.get_word_info(id.entry(), subset)?.resolve(
             dict_id,
             self.num_system_pos,
             &self.pos_offsets,
             subset,
-        );
+        ))
+    }
 
-        Ok(WordInfo::new(word_info_data, id))
+    /// Returns WordInfo for given WordId.
+    /// Only fills a requested subset of fields.
+    /// Rest will be of default values (0 or empty).
+    pub fn get_word_info_subset(&self, id: WordId, subset: InfoSubset) -> SudachiResult<WordInfo> {
+        Ok(WordInfo::new(self.get_word_info_data_subset(id, subset)?, id))
     }
 
     /// Returns word_param for given word_id
@@ -273,9 +284,114 @@ impl LexiconSet<'_> {
     }
 }
 
+// --- tokenizer-local WordInfo cache -------------------------------------------
+// Resolving a `WordInfo` (parse + reference resolution) and decoding its strings
+// repeats for every occurrence of a word. This bounded, tokenizer-local cache
+// resolves each `(word_id, subset)` once and hands later occurrences out as shared
+// `Arc`s. It is owned by the tokenizer, so entries are never shared across
+// dictionaries or threads and need no invalidation.
+
+const CACHE_WAYS: usize = 2;
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct WordInfoCacheKey {
+    word_id: u32,
+    subset: u32,
+}
+
+struct WordInfoCacheEntry {
+    key: WordInfoCacheKey,
+    data: Arc<WordInfoData>,
+    strings: Arc<StringsCache>,
+}
+
+/// Tokenizer-local cache of resolved [`WordInfo`] internals.
+pub(crate) struct WordInfoCache {
+    /// `buckets * CACHE_WAYS` slots, allocated lazily on the first insert so an
+    /// unused or OOV-only tokenizer pays nothing.
+    slots: Option<Box<[Option<WordInfoCacheEntry>]>>,
+    bucket_mask: usize,
+    buckets: usize,
+}
+
+impl WordInfoCache {
+    /// Size the cache for roughly `capacity` entries (`CACHE_WAYS` per bucket, bucket
+    /// count rounded up to a power of two). No memory is allocated until first insert.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let buckets = (capacity / CACHE_WAYS).max(1).next_power_of_two();
+        WordInfoCache {
+            slots: None,
+            bucket_mask: buckets - 1,
+            buckets,
+        }
+    }
+
+    /// Multiplicative hash of the key to a bucket index.
+    #[inline]
+    fn bucket(&self, key: WordInfoCacheKey) -> usize {
+        let mixed = (key.word_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (key.subset as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+        (mixed >> 32) as usize & self.bucket_mask
+    }
+
+    /// Return the cached `WordInfo` for `(word_id, subset)`, resolving and caching it
+    /// on a miss. The subset is part of the key, so a narrow-subset request never
+    /// receives wider cached data. Must not be called for OOV ids: their strings come
+    /// from the input surface, not the dictionary.
+    pub(crate) fn get_or_insert(
+        &mut self,
+        lexicon: &LexiconSet<'_>,
+        word_id: WordId,
+        subset: InfoSubset,
+    ) -> SudachiResult<WordInfo> {
+        assert!(
+            !word_id.is_oov(),
+            "OOV word ids must not be cached; build them with WordInfo::new_oov"
+        );
+        let key = WordInfoCacheKey {
+            word_id: word_id.as_raw(),
+            subset: subset.bits(),
+        };
+        let base = self.bucket(key) * CACHE_WAYS;
+        let total = self.buckets * CACHE_WAYS;
+        let ways = &mut self.slots.get_or_insert_with(|| {
+            std::iter::repeat_with(|| None)
+                .take(total)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })[base..base + CACHE_WAYS];
+
+        if let Some(hit) = ways
+            .iter()
+            .flatten()
+            .find(|entry| entry.key == key)
+        {
+            return Ok(WordInfo::new_shared(
+                Arc::clone(&hit.data),
+                Arc::clone(&hit.strings),
+                word_id,
+            ));
+        }
+
+        // Miss: resolve once and store, reusing an empty way or evicting the first.
+        let data = Arc::new(lexicon.get_word_info_data_subset(word_id, subset)?);
+        let strings = Arc::new(StringsCache::new());
+        let victim = ways.iter().position(Option::is_none).unwrap_or(0);
+        ways[victim] = Some(WordInfoCacheEntry {
+            key,
+            data: Arc::clone(&data),
+            strings: Arc::clone(&strings),
+        });
+        Ok(WordInfo::new_shared(data, strings, word_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::WordInfoCache;
     use crate::dic::binary_loader::LoadedDictionary;
+    use crate::dic::subset::InfoSubset;
+    use crate::dic::word_id::WordId;
 
     const TEST_SYSTEM_DIC: &[u8] = include_bytes!("../../tests/resources/system.dic.test");
 
@@ -320,6 +436,145 @@ mod tests {
 
                 assert_eq!(checked_ends, expected_ends);
             }
+        }
+    }
+
+    /// The key is the exact `(word_id, subset)` pair: a slot filled by a narrow
+    /// subset request must not satisfy a wider request for the same word id.
+    #[test]
+    fn cache_key_is_subset_exact() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        // 東京都 (word id index 6) carries an A-unit split (東京 / 都).
+        let wid = *lex.system_word_ids_in_order().get(6).unwrap();
+        let full = InfoSubset::all();
+
+        let truth = lex.get_word_info_subset(wid, full).unwrap();
+        let truth_split = truth.a_unit_split().to_vec();
+        assert!(!truth_split.is_empty(), "fixture 東京都 must have an A-split");
+
+        let mut cache = WordInfoCache::with_capacity(64);
+        // Poison the slot with a POS_ID-only entry, then request the full subset.
+        let poison = cache
+            .get_or_insert(lex, wid, InfoSubset::POS_ID)
+            .unwrap();
+        assert!(poison.a_unit_split().is_empty());
+        let after = cache.get_or_insert(lex, wid, full).unwrap();
+        assert_eq!(
+            truth_split,
+            after.a_unit_split(),
+            "a POS_ID-only entry must not satisfy an all()-subset request"
+        );
+    }
+
+    /// A word whose normalized form references another word's headword resolves to
+    /// that headword through the cache, and a warm hit returns the identical value.
+    #[test]
+    fn normalized_form_cache_shares_referenced_headword() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let subset = InfoSubset::all();
+        // 行っ normalizes to 行く (a reference to a different word's headword).
+        let wid = lex
+            .system_word_ids_in_order()
+            .into_iter()
+            .find(|&id| {
+                let wi = lex.get_word_info_subset(id, subset).unwrap();
+                wi.borrow_data().normalized_form_word_id() != id
+            })
+            .expect("fixture must contain a referenced normalized form (行っ→行く)");
+
+        let truth = lex
+            .get_word_info_subset(wid, subset)
+            .unwrap()
+            .normalized_form(lex)
+            .to_string();
+
+        let mut cache = WordInfoCache::with_capacity(64);
+        let first = cache.get_or_insert(lex, wid, subset).unwrap();
+        assert_eq!(truth, first.normalized_form(lex));
+        let second = cache.get_or_insert(lex, wid, subset).unwrap();
+        assert_eq!(truth, second.normalized_form(lex));
+        assert_ne!(first.headword(lex), first.normalized_form(lex));
+    }
+
+    /// Every cached lookup must equal the uncached resolution even under extreme
+    /// eviction (1 bucket × 2 ways), so neither hash collisions nor evictions can
+    /// ever return another word's data.
+    #[test]
+    fn cache_stays_correct_under_heavy_eviction() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let subset = InfoSubset::all();
+        let mut cache = WordInfoCache::with_capacity(2); // 1 bucket, 2 ways
+        for &wid in lex.system_word_ids_in_order().iter() {
+            let cached = cache.get_or_insert(lex, wid, subset).unwrap();
+            let truth = lex.get_word_info_subset(wid, subset).unwrap();
+            assert_eq!(cached.pos_id(), truth.pos_id());
+            assert_eq!(cached.normalized_form(lex), truth.normalized_form(lex));
+            assert_eq!(cached.a_unit_split(), truth.a_unit_split());
+        }
+    }
+
+    /// With room for every entry, the warm second pass is all hits and must still
+    /// return each word's own data.
+    #[test]
+    fn cache_serves_warm_hits_correctly() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let subset = InfoSubset::all();
+        let wids = lex.system_word_ids_in_order();
+        let mut cache = WordInfoCache::with_capacity(4096);
+        for _pass in 0..2 {
+            for &wid in wids.iter() {
+                let cached = cache.get_or_insert(lex, wid, subset).unwrap();
+                let truth = lex.get_word_info_subset(wid, subset).unwrap();
+                assert_eq!(cached.normalized_form(lex), truth.normalized_form(lex));
+                assert_eq!(cached.reading_form(lex), truth.reading_form(lex));
+            }
+        }
+    }
+
+    /// The reverse of `cache_key_is_subset_exact`: a full-subset entry must not
+    /// satisfy a narrower request (no superset hit).
+    #[test]
+    fn cache_full_entry_does_not_satisfy_narrow_request() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let wid = *lex.system_word_ids_in_order().get(6).unwrap(); // 東京都 (A-split)
+        let mut cache = WordInfoCache::with_capacity(64);
+        let full = cache.get_or_insert(lex, wid, InfoSubset::all()).unwrap();
+        assert!(!full.a_unit_split().is_empty());
+        let narrow = cache.get_or_insert(lex, wid, InfoSubset::POS_ID).unwrap();
+        let truth = lex.get_word_info_subset(wid, InfoSubset::POS_ID).unwrap();
+        assert_eq!(narrow.a_unit_split(), truth.a_unit_split());
+        assert!(narrow.a_unit_split().is_empty());
+    }
+
+    /// OOV ids must be rejected — their strings come from the input surface, so
+    /// caching them by word id would serve the wrong surface's strings.
+    #[test]
+    #[should_panic(expected = "OOV")]
+    fn oov_id_is_rejected() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let mut cache = WordInfoCache::with_capacity(16);
+        let _ = cache.get_or_insert(lex, WordId::oov(0), InfoSubset::all());
+    }
+
+    /// `with_capacity` must round any size (incl. 0, 1, non-powers-of-two) to a
+    /// usable table.
+    #[test]
+    fn with_capacity_handles_small_and_odd_sizes() {
+        let dic = LoadedDictionary::load_system(TEST_SYSTEM_DIC).unwrap();
+        let lex = &dic.lexicon_set;
+        let wid = *lex.system_word_ids_in_order().first().unwrap();
+        let subset = InfoSubset::all();
+        for cap in [0usize, 1, 3, 7, 31] {
+            let mut cache = WordInfoCache::with_capacity(cap);
+            let miss = cache.get_or_insert(lex, wid, subset).unwrap();
+            let hit = cache.get_or_insert(lex, wid, subset).unwrap();
+            assert_eq!(miss.normalized_form(lex), hit.normalized_form(lex));
         }
     }
 }

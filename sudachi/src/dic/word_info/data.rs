@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use crate::dic::lexicon::strings::StringPointer;
 use crate::dic::strings_cache::StringsCache;
 use crate::dic::subset::InfoSubset;
@@ -177,37 +179,90 @@ pub trait WordInfoResolver: LexiconAccess {}
 
 impl<T: LexiconAccess> WordInfoResolver for T {}
 
+/// Either an owned value or one shared (behind `Arc`) with a cache. Most `WordInfo`s
+/// are owned and allocation-free; only entries handed out by the tokenizer-local
+/// `WordInfoCache` are shared, so the common path pays nothing for the indirection.
+enum MaybeShared<T> {
+    Owned(T),
+    Shared(Arc<T>),
+}
+
+impl<T> std::ops::Deref for MaybeShared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            MaybeShared::Owned(v) => v,
+            MaybeShared::Shared(a) => a,
+        }
+    }
+}
+
+impl<T: Clone> Clone for MaybeShared<T> {
+    fn clone(&self) -> Self {
+        match self {
+            MaybeShared::Owned(v) => MaybeShared::Owned(v.clone()),
+            MaybeShared::Shared(a) => MaybeShared::Shared(Arc::clone(a)),
+        }
+    }
+}
+
+impl<T: Clone> MaybeShared<T> {
+    /// Take the value, cloning only if it is currently shared with a live `Arc`.
+    fn into_inner(self) -> T {
+        match self {
+            MaybeShared::Owned(v) => v,
+            MaybeShared::Shared(a) => Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
+        }
+    }
+}
+
 /// WordInfo API.
 ///
 /// Internal data is not accessible by default, but can be extracted as
-/// `let data: WordInfoData = info.into()`.
-/// Note: this will consume WordInfo.
+/// `let data: WordInfoData = info.into()` (this consumes the `WordInfo`, and clones
+/// the resolved data only if it is currently shared with a live cache entry).
 #[derive(Clone)]
 pub struct WordInfo {
-    data: WordInfoData,
-
-    // keep self word_id for the purpose of simplisity
+    data: MaybeShared<WordInfoData>,
     word_id: WordId,
-
-    // In dict v1, word info contains only string pointers, and the actual strings are resolved via lexicon set.
-    // keep them in the cache to avoid redundant lookups.
-    strings: StringsCache,
+    // In dict v1 the word info holds only string pointers; the actual strings are
+    // resolved against the lexicon set and memoized here on first access.
+    strings: MaybeShared<StringsCache>,
 }
 
 impl WordInfo {
     pub fn new(data: WordInfoData, word_id: WordId) -> Self {
         WordInfo {
-            data,
+            data: MaybeShared::Owned(data),
             word_id,
-            strings: StringsCache::new(),
+            strings: MaybeShared::Owned(StringsCache::new()),
         }
+    }
+
+    /// Construct from resolved data + strings shared with the `WordInfoCache` (a cache
+    /// hit). Both are `Arc::clone`d, so there is no parse, resolve or string re-decode.
+    pub(in crate::dic) fn new_shared(
+        data: Arc<WordInfoData>,
+        strings: Arc<StringsCache>,
+        word_id: WordId,
+    ) -> Self {
+        WordInfo {
+            data: MaybeShared::Shared(data),
+            word_id,
+            strings: MaybeShared::Shared(strings),
+        }
+    }
+
+    /// Borrow the inner resolved data without consuming/cloning.
+    pub fn borrow_data(&self) -> &WordInfoData {
+        &self.data
     }
 
     pub fn new_oov(pos_id: u16, index_form_length: i16, word_id: WordId, headword: String) -> Self {
         Self {
-            data: WordInfoData::new_oov(pos_id as i16, index_form_length),
+            data: MaybeShared::Owned(WordInfoData::new_oov(pos_id as i16, index_form_length)),
             word_id,
-            strings: StringsCache::new_with_single_string(headword),
+            strings: MaybeShared::Owned(StringsCache::new_with_single_string(headword)),
         }
     }
 
@@ -221,14 +276,14 @@ impl WordInfo {
         dictionary_form: String,
     ) -> Self {
         WordInfo {
-            data: WordInfoData::new_oov(pos_id, index_form_length),
+            data: MaybeShared::Owned(WordInfoData::new_oov(pos_id, index_form_length)),
             word_id,
-            strings: StringsCache::new_with_strings(
+            strings: MaybeShared::Owned(StringsCache::new_with_strings(
                 headword,
                 reading,
                 normalized_form,
                 dictionary_form,
-            ),
+            )),
         }
     }
 
@@ -286,14 +341,39 @@ impl WordInfo {
     pub fn user_data(&self) -> &str {
         self.data.user_data()
     }
-
-    pub fn borrow_data(&self) -> &WordInfoData {
-        &self.data
-    }
 }
 
 impl From<WordInfo> for WordInfoData {
     fn from(info: WordInfo) -> Self {
-        info.data
+        info.data.into_inner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `WordInfoData::from(WordInfo)` moves out of an owned handle and clones only
+    /// when the data is still shared with a live cache entry — either way yielding
+    /// the same value.
+    #[test]
+    fn into_word_info_data_owned_and_shared() {
+        let wid = WordId::from_raw(0);
+
+        let owned = WordInfo::new(WordInfoData::new_oov(7, 3), wid);
+        let extracted: WordInfoData = owned.into();
+        assert_eq!(extracted.pos_id(), 7);
+        assert_eq!(extracted.index_form_length(), 3);
+
+        // Keep an alias alive so `try_unwrap` fails and `into()` takes the clone path.
+        let shared = WordInfo::new_shared(
+            Arc::new(WordInfoData::new_oov(7, 3)),
+            Arc::new(StringsCache::new()),
+            wid,
+        );
+        let _alias = shared.clone();
+        let extracted: WordInfoData = shared.into();
+        assert_eq!(extracted.pos_id(), 7);
+        assert_eq!(extracted.index_form_length(), 3);
     }
 }

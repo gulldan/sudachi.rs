@@ -22,7 +22,7 @@ use crate::analysis::stateless_tokenizer::{dump_path, split_path};
 use crate::analysis::Mode;
 use crate::dic::connect::ConnectionMatrix;
 use crate::dic::lexicon::LexiconEntry;
-use crate::dic::lexicon_set::LexiconSet;
+use crate::dic::lexicon_set::{LexiconSet, WordInfoCache};
 use crate::dic::subset::InfoSubset;
 use crate::dic::word_info::WordInfo;
 use crate::dic::DictionaryAccess;
@@ -46,6 +46,9 @@ pub struct StatefulTokenizer<D> {
     match_cache: Vec<Vec<LexiconEntry>>,
     /// Use the pipelined + prefetched dictionary lookup in `build_lattice`.
     pipelined_lookup: bool,
+    /// Tokenizer-local cache of resolved `WordInfo` internals (resolved data and
+    /// decoded strings), reused across sentences and keyed on `(word_id, subset)`.
+    word_info_cache: WordInfoCache,
 }
 
 impl<D: DictionaryAccess + Clone> StatefulTokenizer<D> {
@@ -78,6 +81,9 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
             // byte-for-byte identical to the scalar path and ~8-12% faster
             // end-to-end on real SudachiDict tiers (issue #117).
             pipelined_lookup: true,
+            // Sized above the distinct (word_id, subset) pairs of a sentence corpus;
+            // 2-way set-associative, allocated lazily on first use (~1 MB).
+            word_info_cache: WordInfoCache::with_capacity(32 * 1024),
         }
     }
 
@@ -195,6 +201,8 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
         for pid in self.top_path_ids.drain(..) {
             let (inner, cost) = self.lattice.node(pid);
             let wi = if inner.word_id().is_oov() {
+                // OOV strings depend on the input surface, not the dictionary, so they
+                // must never enter (or be served from) the shared cache.
                 let curr_slice = self.input.curr_slice_c(inner.char_range()).to_owned();
                 WordInfo::new_oov(
                     inner.word_id().entry().as_raw() as u16,
@@ -203,7 +211,8 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
                     curr_slice,
                 )
             } else {
-                lexset.get_word_info_subset(inner.word_id(), self.subset)?
+                self.word_info_cache
+                    .get_or_insert(lexset, inner.word_id(), self.subset)?
             };
 
             let byte_begin = self.input.to_curr_byte_idx(inner.begin());
