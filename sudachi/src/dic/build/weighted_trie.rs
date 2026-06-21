@@ -45,23 +45,26 @@ struct WeightedDoubleArrayBuilder<'a> {
     /// toward a per-(byte-depth % 3) running target, so subarrays for each UTF-8
     /// triplet position get similar relative offsets (modulo values).
     regular: bool,
+    /// offset-objective: 0 = triplet-phase, 1 = parent-child similarity, 2 = parent+stride.
+    objective: u8,
     targets: [u32; 3],
 }
 
 impl<'a> WeightedDoubleArrayBuilder<'a> {
-    fn new(prefix_hits: &'a HashMap<Vec<u8>, u32>, regular: bool) -> Self {
+    fn new(prefix_hits: &'a HashMap<Vec<u8>, u32>, regular: bool, objective: u8) -> Self {
         Self {
             blocks: vec![DoubleArrayBlock::new(0)],
             used_offsets: HashSet::new(),
             prefix_hits,
             regular,
+            objective,
             targets: [0; 3],
         }
     }
 
     fn build(mut self, keyset: &[(Vec<u8>, u32)]) -> Option<Vec<u8>> {
         self.reserve(0);
-        self.build_recursive(keyset, Vec::new(), 0, keyset.len(), 0)?;
+        self.build_recursive(keyset, Vec::new(), 0, keyset.len(), 0, 0)?;
         let mut out = Vec::with_capacity(self.blocks.len() * BLOCK_SIZE * 4);
         for block in &self.blocks {
             for unit in block.units.iter() {
@@ -103,6 +106,7 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
         begin: usize,
         end: usize,
         unit_id: UnitID,
+        parent_offset: u32,
     ) -> Option<()> {
         let depth = prefix.len();
         let mut labels: Vec<(u8, usize, usize)> = Vec::with_capacity(256);
@@ -125,8 +129,14 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
         labels.last_mut().unwrap().2 = end;
 
         let label_bytes = labels.iter().map(|(l, _, _)| *l).collect::<Vec<_>>();
+        const STRIDE: u32 = 16; // 16 u32 = one 64B cache line
+        let target = match self.objective {
+            1 => parent_offset,                        // parent-child offset similarity
+            2 => parent_offset.wrapping_add(STRIDE),   // constant stride from parent
+            _ => self.targets[depth % 3],              // UTF-8 triplet-phase grouping
+        };
         let offset = loop {
-            if let Some(offset) = self.find_offset(unit_id, &label_bytes, depth) {
+            if let Some(offset) = self.find_offset(unit_id, &label_bytes, target) {
                 break offset;
             }
             self.extend_block();
@@ -166,7 +176,7 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
             }
             let mut child_prefix = prefix.clone();
             child_prefix.push(label);
-            let _ = self.build_recursive(keyset, child_prefix, begin, end, (label as u32 ^ offset) as UnitID);
+            let _ = self.build_recursive(keyset, child_prefix, begin, end, (label as u32 ^ offset) as UnitID, offset);
         }
         Some(())
     }
@@ -181,15 +191,14 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
         self.prefix_hits.get(&child).copied().unwrap_or(0)
     }
 
-    fn find_offset(&self, unit_id: UnitID, labels: &[u8], depth: usize) -> Option<u32> {
+    fn find_offset(&self, unit_id: UnitID, labels: &[u8], target: u32) -> Option<u32> {
         let head_block = (self.blocks.len() as i32 - NUM_TARGET_BLOCKS).max(0) as usize;
         if self.regular {
             // Among the first K valid offsets in the searched blocks, pick the one
-            // whose value shares the most high bits with this triplet-position's
-            // running target (smallest XOR distance). K-capped so build stays fast
+            // whose value shares the most high bits with the objective's `target`
+            // (smallest XOR distance). K-capped so build stays fast
             // (SUDACHI_LAYOUT_OFFSET_K, default 16).
             let cap = offset_cap();
-            let target = self.targets[depth % 3];
             let mut best: Option<u32> = None;
             let mut seen = 0usize;
             'outer: for block in self.blocks.iter().skip(head_block) {
@@ -371,6 +380,26 @@ fn record_prefix_hits(da: &[u8], lines: &[&str]) -> HashMap<Vec<u8>, u32> {
 /// `entries` must be sorted by key (as `build_trie` does). Returns `None` on
 /// builder failure (caller falls back to the default builder).
 pub fn build_weighted(entries: &[(&str, u32)], corpus: &str) -> Option<Vec<u8>> {
+    let regular = std::env::var("SUDACHI_LAYOUT_OFFSET_REGULAR").is_ok();
+    build_weighted_cfg(entries, corpus, regular)
+}
+
+/// Parameterized build so a single process can produce several layouts (probes).
+/// `regular = false` is the corpus-frequency child ordering only; `true` adds the
+/// triplet-phase offset-similarity bias.
+pub fn build_weighted_cfg(entries: &[(&str, u32)], corpus: &str, regular: bool) -> Option<Vec<u8>> {
+    build_weighted_obj(entries, corpus, regular, 0)
+}
+
+/// As [`build_weighted_cfg`] with an offset-objective selector (only used when
+/// `regular`): 0 = UTF-8 triplet-phase grouping, 1 = parent-child offset
+/// similarity, 2 = constant stride from the parent offset.
+pub fn build_weighted_obj(
+    entries: &[(&str, u32)],
+    corpus: &str,
+    regular: bool,
+    objective: u8,
+) -> Option<Vec<u8>> {
     let baseline = yada::builder::DoubleArrayBuilder::build(entries)?;
     let lines: Vec<&str> = corpus.lines().collect();
     let prefix_hits = record_prefix_hits(&baseline, &lines);
@@ -378,6 +407,5 @@ pub fn build_weighted(entries: &[(&str, u32)], corpus: &str) -> Option<Vec<u8>> 
         .iter()
         .map(|(k, v)| (k.as_bytes().to_vec(), *v))
         .collect();
-    let regular = std::env::var("SUDACHI_LAYOUT_OFFSET_REGULAR").is_ok();
-    WeightedDoubleArrayBuilder::new(&prefix_hits, regular).build(&keyset)
+    WeightedDoubleArrayBuilder::new(&prefix_hits, regular, objective).build(&keyset)
 }
