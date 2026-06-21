@@ -94,6 +94,9 @@ pub enum BuildFailure {
     #[error("Failed to build trie")]
     TrieBuildFailure,
 
+    #[error("Failed to build charwise DAAC index: {0}")]
+    DaacBuildFailure(String),
+
     #[error(
         "Invalid string pointer during dictionary compilation: length={length}, offset={offset}, alignment={alignment}"
     )]

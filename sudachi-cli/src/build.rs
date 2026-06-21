@@ -129,6 +129,10 @@ pub(crate) struct BuildCmd {
     /// Description string to embed into dictionary
     #[arg(short, long, default_value = "")]
     description: String,
+
+    /// Write the experimental charwise DAAC index block.
+    #[arg(long = "experimental-daac-index")]
+    experimental_daac_index: bool,
 }
 
 pub fn build_main(subcommand: BuildCli) {
@@ -162,6 +166,7 @@ pub fn build_main(subcommand: BuildCli) {
 fn build_system(mut cmd: BuildCmd, matrix: PathBuf, pos: Option<PathBuf>) {
     let mut builder = DictBuilder::new_system();
     builder.set_description(std::mem::take(&mut cmd.description));
+    builder.set_charwise_daac_index(cmd.experimental_daac_index);
     builder
         .read_conn(matrix.as_path())
         .expect("failed to read matrix");
@@ -193,6 +198,7 @@ fn build_user(mut cmd: BuildCmd, system: PathBuf) {
 
     let mut builder = DictBuilder::new_user(&dict);
     builder.set_description(std::mem::take(&mut cmd.description));
+    builder.set_charwise_daac_index(cmd.experimental_daac_index);
     for d in cmd.inputs.iter() {
         builder
             .read_lexicon(d.as_path())

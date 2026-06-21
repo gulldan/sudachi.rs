@@ -64,6 +64,8 @@ pub enum Block {
     // lexicon parts:
     // TRIE
     TRIEIndex,
+    // charwise double-array Aho-Corasick index over index-forms
+    CharwiseDAACIndex,
     // mapping from a index-form to entries
     WordPointers,
     // word entries
@@ -82,6 +84,7 @@ impl Block {
             Block::ConnectionMatrix => "ConnMatrix",
             Block::POSTable => "POS",
             Block::TRIEIndex => "TrieIndex",
+            Block::CharwiseDAACIndex => "CharwiseDAACIndex",
             Block::WordPointers => "WordPointers",
             Block::Entries => "Entries",
             Block::Strings => "Strings",

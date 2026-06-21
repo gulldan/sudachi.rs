@@ -1,0 +1,13 @@
+[package]
+name = "runtime_replacement_probe"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+crawdad = "0.4.0"
+csv = "1.3"
+daachorse = "1.0.1"
+lexime-trie = "0.5.1"
+yada = "0.5.1"

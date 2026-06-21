@@ -51,13 +51,19 @@ fn run_pass(
     tok: &mut StatefulTokenizer<Arc<JapaneseDictionary>>,
     result: &mut MorphemeList<Arc<JapaneseDictionary>>,
     lines: &[&str],
+    collect: bool,
 ) -> usize {
     let mut total = 0;
     for line in lines {
         tok.reset().push_str(line);
         tok.do_tokenize().expect("tokenization failed");
-        result.collect_results(tok).expect("collect failed");
-        total += result.len();
+        // SUDACHI_BENCH_NOCOLLECT=1 isolates the do_tokenize phase (lattice
+        // build + Viterbi, where the connection matrix is touched) from
+        // collect_results (where WordInfo is materialized).
+        if collect {
+            result.collect_results(tok).expect("collect failed");
+            total += result.len();
+        }
     }
     total
 }
@@ -85,14 +91,16 @@ fn main() {
     let lines: Vec<&str> = text.lines().take(limit).collect();
     let total_chars: usize = lines.iter().map(|l| l.chars().count()).sum();
 
+    let collect = std::env::var_os("SUDACHI_BENCH_NOCOLLECT").is_none();
+
     let mut tok = StatefulTokenizer::new(dict.clone(), Mode::C);
     let mut result = MorphemeList::empty(dict.clone());
 
     // Warm up and check both paths agree on output volume.
     tok.set_pipelined_lookup(false);
-    let morphs_scalar = run_pass(&mut tok, &mut result, &lines);
+    let morphs_scalar = run_pass(&mut tok, &mut result, &lines, collect);
     tok.set_pipelined_lookup(true);
-    let morphs_pipelined = run_pass(&mut tok, &mut result, &lines);
+    let morphs_pipelined = run_pass(&mut tok, &mut result, &lines, collect);
     assert_eq!(
         morphs_scalar, morphs_pipelined,
         "scalar and pipelined disagree on total morpheme count"
@@ -117,7 +125,7 @@ fn main() {
             }
             tok.set_pipelined_lookup(pipelined);
             let start = Instant::now();
-            run_pass(&mut tok, &mut result, &lines);
+            run_pass(&mut tok, &mut result, &lines, collect);
             let ms = start.elapsed().as_secs_f64() * 1e3;
             if pipelined {
                 pipelined_ms.push(ms);

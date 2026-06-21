@@ -41,6 +41,7 @@ pub(crate) mod lexicon;
 pub(crate) mod parse;
 pub(crate) mod pos;
 pub mod report;
+pub(crate) mod weighted_trie;
 mod resolve;
 #[cfg(test)]
 mod test;
@@ -156,6 +157,7 @@ pub struct DictBuilder<D> {
     stage: BuilderStage,
     prebuilt: Option<D>,
     reporter: Reporter,
+    build_charwise_daac_index: bool,
 }
 
 impl DictBuilder<NoDic> {
@@ -179,6 +181,7 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
             stage: BuilderStage::Grammar,
             prebuilt: None,
             reporter: Reporter::new(),
+            build_charwise_daac_index: false,
         }
     }
 }
@@ -221,6 +224,15 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
     /// Set the dictionary description
     pub fn set_description<T: Into<String>>(&mut self, description: T) {
         self.description = description.into()
+    }
+
+    /// Enable or disable writing the experimental charwise DAAC index block.
+    ///
+    /// This block is optional and old dictionaries load without it. It is not
+    /// enabled by default because it increases full-tier dictionary size
+    /// substantially and is still under benchmark evaluation.
+    pub fn set_charwise_daac_index(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.build_charwise_daac_index, enabled)
     }
 
     /// Read the connection matrix from either a file or an in-memory buffer
@@ -292,7 +304,7 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
         self.ensure_compile_stage()?;
 
         let mut buffer = vec![0u8; DICT_BLOCK_SIZE];
-        let mut blocks: Vec<BlockInfo> = Vec::with_capacity(7);
+        let mut blocks: Vec<BlockInfo> = Vec::with_capacity(8);
 
         if !self.user {
             self.align_to_block(&mut buffer);
@@ -310,7 +322,7 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
         self.reporter.collect(size, report);
         blocks.push(BlockInfo::new(Block::POSTable, start, size));
 
-        let (trie, word_id_table) = self.build_index_data()?;
+        let (trie, word_id_table, charwise_daac_index) = self.build_index_data()?;
         let strings = StringStore::from_entries(self.lexicon.resolved_entries())?;
 
         self.align_to_block(&mut buffer);
@@ -330,6 +342,19 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
         buffer.write_all(&trie)?;
         self.reporter.collect(trie.len(), report);
         blocks.push(BlockInfo::new(Block::TRIEIndex, start, trie.len()));
+
+        if let Some(charwise_daac_index) = charwise_daac_index {
+            self.align_to_block(&mut buffer);
+            let start = buffer.len();
+            let report = ReportBuilder::new("charwise_daac_index");
+            buffer.write_all(&charwise_daac_index)?;
+            self.reporter.collect(charwise_daac_index.len(), report);
+            blocks.push(BlockInfo::new(
+                Block::CharwiseDAACIndex,
+                start,
+                charwise_daac_index.len(),
+            ));
+        }
 
         self.align_to_block(&mut buffer);
         let start = buffer.len();
@@ -495,7 +520,7 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
         }
     }
 
-    fn build_index_data(&mut self) -> SudachiResult<(Vec<u8>, Vec<u8>)> {
+    fn build_index_data(&mut self) -> SudachiResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
         let mut index = IndexBuilder::new();
         let entry_ids = self.lexicon.row_word_ids(0);
         // Keep non-indexed, non-phantom entries in the word-id table as a
@@ -518,8 +543,13 @@ impl<D: DictionaryAccess + ReferenceIdAccess> DictBuilder<D> {
         }
 
         let word_id_table = index.build_word_id_table(&non_indexed)?;
+        let charwise_daac_index = if self.build_charwise_daac_index {
+            index.build_charwise_daac_index()?
+        } else {
+            None
+        };
         let trie = index.build_trie()?;
-        Ok((trie, word_id_table))
+        Ok((trie, word_id_table, charwise_daac_index))
     }
 
     fn serialize_description(

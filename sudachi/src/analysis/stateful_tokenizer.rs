@@ -21,7 +21,7 @@ use crate::analysis::node::{LatticeNode, ResultNode};
 use crate::analysis::stateless_tokenizer::{dump_path, split_path};
 use crate::analysis::Mode;
 use crate::dic::connect::ConnectionMatrix;
-use crate::dic::lexicon::LexiconEntry;
+use crate::dic::lexicon::LexiconTrieHit;
 use crate::dic::lexicon_set::LexiconSet;
 use crate::dic::subset::InfoSubset;
 use crate::dic::word_info::WordInfo;
@@ -43,7 +43,7 @@ pub struct StatefulTokenizer<D> {
     subset: InfoSubset,
     /// Per-boundary dictionary-match cache, reused across sentences, for the
     /// pipelined-prefetch lattice path (issue #117).
-    match_cache: Vec<Vec<LexiconEntry>>,
+    trie_hit_cache: Vec<Vec<LexiconTrieHit>>,
     /// Use the pipelined + prefetched dictionary lookup in `build_lattice`.
     pipelined_lookup: bool,
 }
@@ -73,7 +73,7 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
             top_path_ids: Vec::new(),
             top_path: Some(Vec::new()),
             subset: InfoSubset::all(),
-            match_cache: Vec::new(),
+            trie_hit_cache: Vec::new(),
             // Pipelined + prefetched dictionary lookup is the default: it is
             // byte-for-byte identical to the scalar path and ~8-12% faster
             // end-to-end on real SudachiDict tiers (issue #117).
@@ -247,7 +247,7 @@ impl<D: DictionaryAccess> StatefulTokenizer<D> {
             oov_providers: self.dictionary.oov_provider_plugins(),
             lexicon: self.dictionary.lexicon(),
             input: &self.input,
-            match_cache: &mut self.match_cache,
+            trie_hit_cache: &mut self.trie_hit_cache,
             pipelined: self.pipelined_lookup,
         };
         builder.build_lattice()
@@ -276,7 +276,7 @@ struct LatticeBuilder<'a> {
     input: &'a InputBuffer,
     lexicon: &'a LexiconSet<'a>,
     oov_providers: &'a [Box<dyn OovProviderPlugin + Sync + Send>],
-    match_cache: &'a mut Vec<Vec<LexiconEntry>>,
+    trie_hit_cache: &'a mut Vec<Vec<LexiconTrieHit>>,
     pipelined: bool,
 }
 
@@ -331,60 +331,50 @@ impl<'a> LatticeBuilder<'a> {
         Ok(())
     }
 
-    /// Pipelined + prefetched lattice builder (issue #117): pre-compute every
-    /// boundary's dictionary matches with overlapped trie memory latency, then
+    /// Pipelined + prefetched lattice builder (issue #117): first collect raw
+    /// trie hits with overlapped trie memory latency, then expand hits and
     /// insert nodes for reachable boundaries in the same order as the scalar
-    /// path. The trie walks depend only on the input, not on the lattice, so
-    /// precomputing all boundaries is exact; reachability still gates insertion.
+    /// path. Keeping WordIdTable/params/lattice traffic out of the trie phase
+    /// avoids competing with the trie array for L1 cache.
     #[inline]
     fn build_lattice_pipelined(&mut self) -> SudachiResult<()> {
         let input_bytes = self.input.current().as_bytes();
+        let starts = self.input.curr_byte_offsets();
 
-        {
-            let lexicon = self.lexicon;
-            let starts = self.input.curr_byte_offsets();
-            let cache = &mut *self.match_cache;
-            if cache.len() < starts.len() {
-                cache.resize_with(starts.len(), Vec::new);
-            }
-            for bucket in cache.iter_mut() {
-                bucket.clear();
-            }
-            lexicon.lookup_batch(input_bytes, starts, |bucket, entry| {
-                cache[bucket].push(entry);
-            });
-        }
+        self.collect_trie_hits(input_bytes, starts);
 
-        let boundaries = self.input.curr_byte_offsets().len();
-        for ch_off in 0..boundaries {
+        let lexicon = self.lexicon;
+        for ch_off in 0..starts.len() {
             if !self.lattice.has_previous_node(ch_off) {
                 continue;
             }
 
             self.node_buffer.clear();
             let mut created = CreatedWords::default();
-            // Indexed access keeps each `match_cache` borrow transient so it does
-            // not conflict with the node_buffer/lattice mutations below.
-            let count = self.match_cache[ch_off].len();
+            // Indexed access keeps each `trie_hit_cache` borrow transient so it
+            // does not conflict with the node_buffer/lattice mutations below.
+            let count = self.trie_hit_cache[ch_off].len();
             for idx in 0..count {
-                let end = self.match_cache[ch_off][idx].end;
-                let word_id = self.match_cache[ch_off][idx].word_id;
+                let hit = self.trie_hit_cache[ch_off][idx];
+                let end = hit.end;
                 if (end < input_bytes.len()) && !self.input.can_bow(end) {
                     continue;
                 }
-                let (left_id, right_id, cost) = self.lexicon.get_word_param(word_id);
-                let end_c = self.input.ch_idx(end);
-                let node = Node::new(
-                    ch_off as u16,
-                    end_c as u16,
-                    left_id as u16,
-                    right_id as u16,
-                    cost,
-                    word_id,
-                );
-                created = created.add_word((end_c - ch_off) as i64);
-                self.node_buffer.push(node.clone());
-                self.lattice.insert(node, self.matrix);
+                for entry in lexicon.entries_for_trie_hit(hit) {
+                    let (left_id, right_id, cost) = lexicon.get_word_param(entry.word_id);
+                    let end_c = self.input.ch_idx(entry.end);
+                    let node = Node::new(
+                        ch_off as u16,
+                        end_c as u16,
+                        left_id as u16,
+                        right_id as u16,
+                        cost,
+                        entry.word_id,
+                    );
+                    created = created.add_word((end_c - ch_off) as i64);
+                    self.node_buffer.push(node.clone());
+                    self.lattice.insert(node, self.matrix);
+                }
             }
 
             self.insert_oovs(ch_off, created)?;
@@ -392,6 +382,21 @@ impl<'a> LatticeBuilder<'a> {
         self.lattice.connect_eos(self.matrix)?;
 
         Ok(())
+    }
+
+    #[inline]
+    fn collect_trie_hits(&mut self, input_bytes: &[u8], starts: &[usize]) {
+        let cache = &mut *self.trie_hit_cache;
+        if cache.len() < starts.len() {
+            cache.resize_with(starts.len(), Vec::new);
+        }
+        for bucket in cache.iter_mut().take(starts.len()) {
+            bucket.clear();
+        }
+        self.lexicon
+            .lookup_trie_batch(input_bytes, starts, |bucket, hit| {
+                cache[bucket].push(hit);
+            });
     }
 
     /// OOV handling shared by both lattice builders. Mirrors the original
@@ -433,5 +438,326 @@ impl<'a> LatticeBuilder<'a> {
             self.lattice.insert(node, self.matrix);
         }
         Ok(other)
+    }
+}
+
+#[cfg(test)]
+mod issue_117_probe {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::dic::dictionary::JapaneseDictionary;
+
+    #[derive(Default)]
+    struct ProbeTotals {
+        lines: usize,
+        chars: usize,
+        starts: usize,
+        reachable: usize,
+        raw_hits: usize,
+        raw_hits_reachable: usize,
+        raw_hits_unreachable: usize,
+        trie_leaves_expanded: usize,
+        expanded_entries: usize,
+        can_bow_rejected: usize,
+        dict_nodes_inserted: usize,
+        dict_prev_nodes_scanned: usize,
+        max_prev_nodes: usize,
+        oov_boundaries: usize,
+        old_batch_entries: usize,
+        scalar_all_entries: usize,
+        scalar_reachable_entries: usize,
+        strict_total: Duration,
+        strict_collect: Duration,
+        strict_expand_insert: Duration,
+        strict_oov: Duration,
+        strict_eos: Duration,
+        old_batch_all: Duration,
+        scalar_all: Duration,
+        scalar_reachable: Duration,
+    }
+
+    impl ProbeTotals {
+        fn ns_per_char(duration: Duration, chars: usize) -> f64 {
+            duration.as_secs_f64() * 1e9 / chars.max(1) as f64
+        }
+
+        fn pct(part: usize, total: usize) -> f64 {
+            part as f64 * 100.0 / total.max(1) as f64
+        }
+
+        fn print(&self) {
+            println!(
+                "# lines={} chars={} starts={} reachable={} ({:.1}%)",
+                self.lines,
+                self.chars,
+                self.starts,
+                self.reachable,
+                Self::pct(self.reachable, self.starts)
+            );
+            println!(
+                "# raw_hits={} reachable={} unreachable={} ({:.1}% wasted hits)",
+                self.raw_hits,
+                self.raw_hits_reachable,
+                self.raw_hits_unreachable,
+                Self::pct(self.raw_hits_unreachable, self.raw_hits)
+            );
+            println!(
+                "# leaves_expanded={} entries={} can_bow_rejected={} inserted={}",
+                self.trie_leaves_expanded,
+                self.expanded_entries,
+                self.can_bow_rejected,
+                self.dict_nodes_inserted
+            );
+            println!(
+                "# dict_prev_nodes_scanned={} avg_prev_per_insert={:.2} max_prev_nodes={}",
+                self.dict_prev_nodes_scanned,
+                self.dict_prev_nodes_scanned as f64 / self.dict_nodes_inserted.max(1) as f64,
+                self.max_prev_nodes
+            );
+            println!(
+                "# old_batch_entries={} scalar_all_entries={} scalar_reachable_entries={}",
+                self.old_batch_entries, self.scalar_all_entries, self.scalar_reachable_entries
+            );
+            println!(
+                "strict_total        {:>8.2} ms  {:>7.2} ns/char",
+                self.strict_total.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.strict_total, self.chars)
+            );
+            println!(
+                "  collect_raw      {:>8.2} ms  {:>7.2} ns/char",
+                self.strict_collect.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.strict_collect, self.chars)
+            );
+            println!(
+                "  expand_insert    {:>8.2} ms  {:>7.2} ns/char",
+                self.strict_expand_insert.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.strict_expand_insert, self.chars)
+            );
+            println!(
+                "  oov              {:>8.2} ms  {:>7.2} ns/char",
+                self.strict_oov.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.strict_oov, self.chars)
+            );
+            println!(
+                "  eos              {:>8.2} ms  {:>7.2} ns/char",
+                self.strict_eos.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.strict_eos, self.chars)
+            );
+            println!(
+                "old_batch_all      {:>8.2} ms  {:>7.2} ns/char",
+                self.old_batch_all.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.old_batch_all, self.chars)
+            );
+            println!(
+                "scalar_all         {:>8.2} ms  {:>7.2} ns/char",
+                self.scalar_all.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.scalar_all, self.chars)
+            );
+            println!(
+                "scalar_reachable   {:>8.2} ms  {:>7.2} ns/char",
+                self.scalar_reachable.as_secs_f64() * 1e3,
+                Self::ns_per_char(self.scalar_reachable, self.chars)
+            );
+        }
+    }
+
+    fn env_path(key: &str, default: &str) -> PathBuf {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(default))
+    }
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn build_input(dict: &JapaneseDictionary, line: &str) -> SudachiResult<InputBuffer> {
+        let mut input = InputBuffer::default();
+        input.reset().push_str(line);
+        input.start_build()?;
+        for plugin in dict.input_text_plugins() {
+            plugin.rewrite(&mut input)?;
+        }
+        input.build(dict.grammar())?;
+        Ok(input)
+    }
+
+    fn probe_strict_build(
+        dict: &JapaneseDictionary,
+        input: &InputBuffer,
+        node_buffer: &mut Vec<Node>,
+        lattice: &mut Lattice,
+        trie_hit_cache: &mut Vec<Vec<LexiconTrieHit>>,
+        totals: &mut ProbeTotals,
+        reachable_out: &mut Vec<usize>,
+    ) -> SudachiResult<()> {
+        let mut builder = LatticeBuilder {
+            node_buffer,
+            lattice,
+            matrix: dict.grammar().conn_matrix(),
+            input,
+            lexicon: dict.lexicon(),
+            oov_providers: dict.oov_provider_plugins(),
+            trie_hit_cache,
+            pipelined: true,
+        };
+
+        let input_bytes = input.current().as_bytes();
+        let starts = input.curr_byte_offsets();
+        let total_start = Instant::now();
+        builder.lattice.reset(input.current_chars().len());
+
+        let t = Instant::now();
+        builder.collect_trie_hits(input_bytes, starts);
+        totals.strict_collect += t.elapsed();
+
+        totals.starts += starts.len();
+        totals.raw_hits += builder
+            .trie_hit_cache
+            .iter()
+            .take(starts.len())
+            .map(Vec::len)
+            .sum::<usize>();
+
+        let t = Instant::now();
+        for ch_off in 0..starts.len() {
+            let hit_count = builder.trie_hit_cache[ch_off].len();
+            if !builder.lattice.has_previous_node(ch_off) {
+                totals.raw_hits_unreachable += hit_count;
+                continue;
+            }
+
+            totals.reachable += 1;
+            totals.raw_hits_reachable += hit_count;
+            reachable_out.push(ch_off);
+
+            builder.node_buffer.clear();
+            let mut created = CreatedWords::default();
+
+            let lexicon = builder.lexicon;
+            for idx in 0..hit_count {
+                let hit = builder.trie_hit_cache[ch_off][idx];
+                totals.trie_leaves_expanded += 1;
+                let end = hit.end;
+                if (end < input_bytes.len()) && !builder.input.can_bow(end) {
+                    totals.can_bow_rejected += 1;
+                    continue;
+                }
+                for entry in lexicon.entries_for_trie_hit(hit) {
+                    totals.expanded_entries += 1;
+                    let (left_id, right_id, cost) = lexicon.get_word_param(entry.word_id);
+                    let end_c = builder.input.ch_idx(entry.end);
+                    let node = Node::new(
+                        ch_off as u16,
+                        end_c as u16,
+                        left_id as u16,
+                        right_id as u16,
+                        cost,
+                        entry.word_id,
+                    );
+                    created = created.add_word((end_c - ch_off) as i64);
+                    builder.node_buffer.push(node.clone());
+                    let prev_nodes = builder.lattice.previous_node_count(ch_off);
+                    totals.dict_prev_nodes_scanned += prev_nodes;
+                    totals.max_prev_nodes = totals.max_prev_nodes.max(prev_nodes);
+                    builder.lattice.insert(node, builder.matrix);
+                    totals.dict_nodes_inserted += 1;
+                }
+            }
+
+            let before = created;
+            builder.insert_oovs(ch_off, created)?;
+            if before.is_empty() || builder.input.can_oov_bow(ch_off) {
+                totals.oov_boundaries += 1;
+            }
+        }
+        totals.strict_expand_insert += t.elapsed();
+
+        let t = Instant::now();
+        builder.lattice.connect_eos(builder.matrix)?;
+        totals.strict_eos += t.elapsed();
+        totals.strict_total += total_start.elapsed();
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "issue #117 phase probe; set SUDACHI_BENCH_* env vars and run under --release --nocapture"]
+    fn pipeline_phase_probe_issue_117() {
+        let config_path = env_path("SUDACHI_BENCH_CONFIG", "resources/sudachi.json");
+        let resource_dir = config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty());
+        let dict_override = std::env::var_os("SUDACHI_BENCH_DICT").map(PathBuf::from);
+        let config = Config::new(Some(config_path.clone()), resource_dir, dict_override)
+            .expect("failed to load config");
+        let dict = Arc::new(JapaneseDictionary::from_cfg(&config).expect("failed to load dict"));
+        let inputs_path = env_path(
+            "SUDACHI_BENCH_INPUTS",
+            "target/issue-117-corpora/kyoto-leads.txt",
+        );
+        let limit = env_usize("SUDACHI_BENCH_LIMIT", usize::MAX);
+        let text = std::fs::read_to_string(&inputs_path).expect("failed to read inputs");
+
+        let mut totals = ProbeTotals::default();
+        let mut reachable = Vec::new();
+        let mut node_buffer = Vec::with_capacity(10);
+        let mut lattice = Lattice::default();
+        let mut trie_hit_cache = Vec::new();
+        for line in text.lines().take(limit) {
+            let input = build_input(&dict, line).expect("failed to build input");
+            if input.current().is_empty() {
+                continue;
+            }
+            totals.lines += 1;
+            totals.chars += input.current().chars().count();
+
+            reachable.clear();
+            probe_strict_build(
+                &dict,
+                &input,
+                &mut node_buffer,
+                &mut lattice,
+                &mut trie_hit_cache,
+                &mut totals,
+                &mut reachable,
+            )
+            .expect("strict build probe failed");
+
+            let input_bytes = input.current().as_bytes();
+            let starts = input.curr_byte_offsets();
+            let lexicon = dict.lexicon();
+
+            let t = Instant::now();
+            lexicon.lookup_batch(input_bytes, starts, |_, _| {
+                totals.old_batch_entries += 1;
+            });
+            totals.old_batch_all += t.elapsed();
+
+            let t = Instant::now();
+            for &start in starts {
+                totals.scalar_all_entries += lexicon.lookup(input_bytes, start).count();
+            }
+            totals.scalar_all += t.elapsed();
+
+            let t = Instant::now();
+            for &ch_off in &reachable {
+                totals.scalar_reachable_entries +=
+                    lexicon.lookup(input_bytes, starts[ch_off]).count();
+            }
+            totals.scalar_reachable += t.elapsed();
+        }
+
+        println!("# config: {}", config_path.display());
+        println!("# inputs: {}", inputs_path.display());
+        totals.print();
     }
 }

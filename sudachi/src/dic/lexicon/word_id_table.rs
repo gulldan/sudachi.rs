@@ -53,6 +53,7 @@ pub struct DeltaCompressedEntryIdIter<'a> {
 }
 
 impl<'a> DeltaCompressedEntryIdIter<'a> {
+    #[inline(always)]
     pub fn new(bytes: &'a [u8]) -> Self {
         let (remining, consumed) = decode_varint32(bytes);
 

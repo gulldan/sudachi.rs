@@ -25,6 +25,111 @@ pub struct ConnectionMatrix<'a> {
     num_right: usize,
 }
 
+// ----------------------------------------------------------------------------
+// PROBE (not for upstream): a process-global, runtime-toggleable index mask for
+// the connection-matrix load. `cost()` does `index & PROBE_MASK` before the
+// load; `usize::MAX` is a no-op (still emits the AND, for fairness). Confining
+// the index to a small power-of-two footprint forces every matrix access into
+// L1/L2 while keeping the *exact same instruction stream* and the *exact same
+// number of loads* — a causal test of "is the matrix memory-latency bound?"
+// that needs no profiler attribution. Being a global (read with a relaxed
+// atomic = a plain load on aarch64) lets a benchmark flip it per trial so a
+// single process can interleave baseline vs masked with shared thermal/cache
+// state, killing cross-process drift.
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub static PROBE_MASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PROBE_ENV_INIT: std::sync::Once = std::sync::Once::new();
+
+// PROBE: working-set recorder. When enabled, every real (unmasked) matrix index
+// is recorded so we can measure how many distinct cells / cache lines / bytes
+// natural text actually touches — the figure that decides which cache level the
+// matrix lives in on a given CPU. One untimed pass only.
+pub static PROBE_RECORD: AtomicBool = AtomicBool::new(false);
+pub static PROBE_TOUCHED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+    std::sync::Mutex::new(None);
+
+pub fn probe_record_begin() {
+    *PROBE_TOUCHED.lock().unwrap() = Some(std::collections::HashSet::new());
+    PROBE_RECORD.store(true, Ordering::Relaxed);
+}
+
+/// Stops recording and returns the set of distinct cell indices touched.
+pub fn probe_record_end() -> Vec<u32> {
+    PROBE_RECORD.store(false, Ordering::Relaxed);
+    PROBE_TOUCHED
+        .lock()
+        .unwrap()
+        .take()
+        .map(|s| s.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Set the probe mask at runtime. `entries` is a power-of-two footprint in i16
+/// entries (e.g. 8192 = 16 KiB); `usize::MAX` restores the full matrix.
+pub fn set_probe_mask(entries: usize) {
+    let mask = if entries == usize::MAX {
+        usize::MAX
+    } else if entries.is_power_of_two() {
+        entries - 1
+    } else {
+        usize::MAX
+    };
+    PROBE_MASK.store(mask, Ordering::Relaxed);
+}
+
+/// PROBE: when true, `cost()` returns arithmetic on the index instead of loading
+/// from the matrix — reproduces the study note's `nomat` probe.
+pub static PROBE_NOMAT: AtomicBool = AtomicBool::new(false);
+pub fn set_probe_nomat(b: bool) {
+    PROBE_NOMAT.store(b, Ordering::Relaxed);
+}
+
+// PROBE: connection-class approximation. Emulates "a simpler model with fewer
+// effective connection classes" (what merging redundant IDs / a sparser CRF
+// would yield): each left/right id is mapped to a class, and cost is read from
+// a small KL x KR block matrix. If KL*KR fits L1, this is the structure that
+// would recover the measured ~7-9%. Lets us measure how much *output* changes
+// at that compression — the missing half of "relearn the matrix".
+pub struct ApproxModel {
+    pub cll: Vec<u16>,   // left id -> class, len = num_left
+    pub clr: Vec<u16>,   // right id -> class, len = num_right
+    pub block: Vec<i16>, // KL x KR, row-major (kr columns)
+    pub kr: usize,
+}
+pub static PROBE_APPROX: AtomicBool = AtomicBool::new(false);
+static APPROX_MODEL: std::sync::OnceLock<ApproxModel> = std::sync::OnceLock::new();
+pub fn install_approx(m: ApproxModel) {
+    let _ = APPROX_MODEL.set(m);
+    PROBE_APPROX.store(true, Ordering::Relaxed);
+}
+
+// PROBE: full-matrix replacement. Lets an experiment swap in an arbitrary
+// approximated matrix (e.g. a low-rank reconstruction) and measure how much the
+// tokenization OUTPUT changes. Same layout as the real matrix.
+pub static PROBE_REPLACE: AtomicBool = AtomicBool::new(false);
+static REPLACE_MATRIX: std::sync::OnceLock<Vec<i16>> = std::sync::OnceLock::new();
+pub fn install_replace(m: Vec<i16>) {
+    let _ = REPLACE_MATRIX.set(m);
+    PROBE_REPLACE.store(true, Ordering::Relaxed);
+}
+
+fn init_probe_from_env(size: usize) {
+    PROBE_ENV_INIT.call_once(|| {
+        if let Some(entries) = std::env::var("SUDACHI_MATRIX_MASK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|e| e.is_power_of_two() && *e <= size)
+        {
+            PROBE_MASK.store(entries - 1, Ordering::Relaxed);
+            eprintln!(
+                "# MATRIX PROBE active from env: footprint={} entries / {} bytes",
+                entries,
+                entries * 2
+            );
+        }
+    });
+}
+
 impl<'a> ConnectionMatrix<'a> {
     pub fn from_bytes(buf: &'a [u8]) -> SudachiResult<ConnectionMatrix<'a>> {
         let (rest, (num_left, num_right)) = nom::sequence::tuple((le_i16, le_i16))(buf)?;
@@ -43,6 +148,7 @@ impl<'a> ConnectionMatrix<'a> {
             return Err(SudachiError::InvalidDictionaryGrammar.with_context("connection matrix"));
         }
 
+        init_probe_from_env(size);
         Ok(ConnectionMatrix {
             data: CowArray::from_bytes(data, offset, size),
             num_left,
@@ -82,7 +188,33 @@ impl<'a> ConnectionMatrix<'a> {
     /// It is OK to make usage of tampered binary dictionaries UB.
     #[inline(always)]
     pub fn cost(&self, left: u16, right: u16) -> i16 {
-        let index = self.index(left, right);
+        if PROBE_REPLACE.load(Ordering::Relaxed) {
+            if let Some(m) = REPLACE_MATRIX.get() {
+                return unsafe { *m.get_unchecked(self.index(left, right)) };
+            }
+        }
+        if PROBE_APPROX.load(Ordering::Relaxed) {
+            if let Some(m) = APPROX_MODEL.get() {
+                let a = m.cll[left as usize] as usize;
+                let b = m.clr[right as usize] as usize;
+                return m.block[a * m.kr + b];
+            }
+        }
+        // PROBE: `& PROBE_MASK` is present in every run (no-op when the mask is
+        // usize::MAX) so the instruction stream is identical; only the load's
+        // memory footprint changes. Relaxed load = a plain LDR on aarch64.
+        let raw = self.index(left, right);
+        if PROBE_RECORD.load(Ordering::Relaxed) {
+            if let Ok(mut g) = PROBE_TOUCHED.lock() {
+                if let Some(set) = g.as_mut() {
+                    set.insert(raw as u32);
+                }
+            }
+        }
+        let index = raw & PROBE_MASK.load(Ordering::Relaxed);
+        if PROBE_NOMAT.load(Ordering::Relaxed) {
+            return index as i16;
+        }
         *unsafe { self.data.get_unchecked(index) }
     }
 

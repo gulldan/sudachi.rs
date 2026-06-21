@@ -19,6 +19,7 @@ use crate::dic::description::{Block, Description};
 use crate::dic::error::DictionaryCompatibilityError;
 use crate::dic::grammar::Grammar;
 use crate::dic::header::HeaderError;
+use crate::dic::lexicon::daac::CharwiseDaacIndex;
 use crate::dic::lexicon::strings::CompactedStrings;
 use crate::dic::lexicon::trie::Trie;
 use crate::dic::lexicon::word_id_table::WordIdTable;
@@ -145,6 +146,9 @@ impl<'a> BinaryGrammar<'a> {
 pub struct BinaryLexicon<'a> {
     /// TRIE (double array), mapping from index form to WordIdTable offset
     pub trie: Trie<'a>,
+    /// Optional charwise DAAC index over index-forms, with the same values as
+    /// the trie.
+    pub(crate) charwise_daac: Option<CharwiseDaacIndex>,
     /// list of word ids that have the same index form
     pub word_id_table: WordIdTable<'a>,
     /// list of word information (for analysis)
@@ -161,6 +165,10 @@ impl<'a> BinaryLexicon<'a> {
     /// load a lexicon from bytes
     pub fn load(buf: &'a [u8], description: &Description) -> SudachiResult<Self> {
         let trie = Trie::from_bytes(description.slice(buf, Block::TRIEIndex)?);
+        let charwise_daac = description
+            .slice_or_none(buf, Block::CharwiseDAACIndex)?
+            .map(CharwiseDaacIndex::from_bytes)
+            .transpose()?;
         let word_id_table = WordIdTable::from_bytes(description.slice(buf, Block::WordPointers)?);
 
         // word_params and word_infos share the same byte range.
@@ -175,6 +183,7 @@ impl<'a> BinaryLexicon<'a> {
 
         Ok(Self {
             trie,
+            charwise_daac,
             word_id_table,
             word_params,
             word_infos,

@@ -15,9 +15,11 @@
  */
 
 use crate::dic::build::error::{BuildFailure, DicBuildError};
+use crate::dic::lexicon::daac::serialize_charwise_daac;
 use crate::dic::word_id::WordId;
 use crate::error::{SudachiError, SudachiResult};
 use crate::util::fxhash::FxBuildHasher;
+use daachorse::CharwiseDoubleArrayAhoCorasick;
 use indexmap::map::IndexMap;
 
 pub struct IndexEntry {
@@ -79,6 +81,34 @@ impl<'a> IndexBuilder<'a> {
         Ok(result)
     }
 
+    pub fn build_charwise_daac_index(&self) -> SudachiResult<Option<Vec<u8>>> {
+        if self.data.is_empty() {
+            return Ok(None);
+        }
+
+        let mut patvals = Vec::with_capacity(self.data.len());
+        for (key, entry) in self.data.iter() {
+            if entry.offset > u32::MAX as _ {
+                return Err(DicBuildError {
+                    file: format!("entry {}", key),
+                    line: 0,
+                    cause: BuildFailure::WordIdTableNotBuilt,
+                }
+                .into());
+            }
+            patvals.push((*key, entry.offset as u32));
+        }
+
+        let daac =
+            CharwiseDoubleArrayAhoCorasick::with_values(patvals).map_err(|err| DicBuildError {
+                file: "<charwise daac>".to_owned(),
+                line: 0,
+                cause: BuildFailure::DaacBuildFailure(err.to_string()),
+            })?;
+
+        Ok(Some(serialize_charwise_daac(&daac)))
+    }
+
     pub fn build_trie(&mut self) -> SudachiResult<Vec<u8>> {
         let mut trie_entries: Vec<(&str, u32)> = Vec::new();
         for (k, v) in self.data.drain(..) {
@@ -95,7 +125,17 @@ impl<'a> IndexBuilder<'a> {
         self.data.shrink_to_fit();
         trie_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-        let trie = yada::builder::DoubleArrayBuilder::build(&trie_entries);
+        // PROBE: corpus-frequency-weighted layout (issue #117) when
+        // SUDACHI_LAYOUT_CORPUS is set; otherwise the shipped yada builder.
+        let trie = match std::env::var_os("SUDACHI_LAYOUT_CORPUS") {
+            Some(path) => {
+                let corpus = std::fs::read_to_string(&path)
+                    .expect("SUDACHI_LAYOUT_CORPUS: failed to read corpus file");
+                eprintln!("# TRIE LAYOUT PROBE: corpus-frequency weighted trie build active");
+                crate::dic::build::weighted_trie::build_weighted(&trie_entries, &corpus)
+            }
+            None => yada::builder::DoubleArrayBuilder::build(&trie_entries),
+        };
         match trie {
             Some(t) => Ok(t),
             None => Err(DicBuildError {

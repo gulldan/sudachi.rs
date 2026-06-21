@@ -165,6 +165,11 @@ impl Lattice {
         self.ends.get(i).map(|d| !d.is_empty()).unwrap_or(false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn previous_node_count(&self, i: usize) -> usize {
+        self.ends.get(i).map(Vec::len).unwrap_or(0)
+    }
+
     /// Lookup a node for the index
     pub fn node(&self, id: NodeIdx) -> (&Node, i32) {
         let node = &self.ends_full[id.end() as usize][id.index() as usize];

@@ -16,6 +16,33 @@
 
 use crate::util::cow_array::CowArray;
 use crate::util::prefetch::prefetch_l1;
+
+// PROBE (not for upstream): runtime knob to decompose the pipelined lattice win
+// into separation vs software-pipelining vs explicit prefetch. Defaults match
+// the shipped behaviour (4 lanes, prefetch on). Overridden once from env
+// SUDACHI_TRIE_LANES / SUDACHI_TRIE_PREFETCH.
+pub static PROBE_LANES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+pub static PROBE_PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PROBE_TRIE_INIT: std::sync::Once = std::sync::Once::new();
+pub fn probe_init_from_env() {
+    use std::sync::atomic::Ordering;
+    PROBE_TRIE_INIT.call_once(|| {
+        if let Some(v) = std::env::var("SUDACHI_TRIE_LANES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            PROBE_LANES.store(v, Ordering::Relaxed);
+        }
+        if let Ok(p) = std::env::var("SUDACHI_TRIE_PREFETCH") {
+            PROBE_PREFETCH.store(p != "0", Ordering::Relaxed);
+        }
+        let l = PROBE_LANES.load(Ordering::Relaxed);
+        let pf = PROBE_PREFETCH.load(Ordering::Relaxed);
+        if l != 4 || !pf {
+            eprintln!("# TRIE PROBE: lanes={l}, prefetch={pf}");
+        }
+    });
+}
 use std::iter::FusedIterator;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -88,10 +115,32 @@ enum Step {
 /// This is the single source of truth for the trie-walk arithmetic shared by
 /// the scalar [`TrieEntryIter`] and the pipelined [`Trie::common_prefix_batch`].
 /// Keeping it in one place guarantees the two paths produce identical results.
+// PROBE (not for upstream): record the sequence of trie array indices loaded by
+// the walk, to measure the trie working set and the upper bound of any layout
+// optimization (issue #117 / eiennohito #3) via scattered-vs-packed pointer
+// chasing. Guarded by an atomic so normal walks pay only a predicted-false load.
+pub static PROBE_TRIE_REC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static TRIE_SEQ: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+pub fn trie_rec_begin() {
+    TRIE_SEQ.with(|v| v.borrow_mut().clear());
+    PROBE_TRIE_REC.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn trie_rec_end() -> Vec<u32> {
+    PROBE_TRIE_REC.store(false, std::sync::atomic::Ordering::Relaxed);
+    TRIE_SEQ.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
 #[inline(always)]
 fn step_once(trie: &[u32], k: u8, node_pos: &mut usize) -> Step {
     let k = k as usize;
     *node_pos ^= k;
+    if PROBE_TRIE_REC.load(std::sync::atomic::Ordering::Relaxed) {
+        let p = *node_pos as u32;
+        TRIE_SEQ.with(|v| v.borrow_mut().push(p));
+    }
     // UB if out of bounds, same contract as the scalar iterator: the trie is
     // built so that every reachable index is valid.
     let unit = *unsafe { trie.get_unchecked(*node_pos) } as usize;
@@ -220,6 +269,7 @@ impl<'a> Trie<'a> {
             };
         }
         match lanes {
+            1 => dispatch!(1), // PROBE: pure separation, no MLP, no prefetch
             0..=2 => dispatch!(2),
             3..=4 => dispatch!(4),
             5..=6 => dispatch!(6),

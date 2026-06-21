@@ -16,6 +16,7 @@
 
 use std::cmp;
 
+use self::daac::CharwiseDaacIndex;
 use self::trie::Trie;
 use self::word_id_table::WordIdTable;
 use self::word_params::WordParams;
@@ -28,6 +29,7 @@ use crate::dic::word_info::{WordInfoEntryIdCursor, WordInfoRefData, WordInfos};
 use crate::dic::DictionaryAccess;
 use crate::prelude::*;
 
+pub(crate) mod daac;
 pub mod strings;
 pub mod trie;
 pub mod word_id_table;
@@ -46,6 +48,7 @@ pub struct Lexicon<'a> {
     lex_id: u8,
 
     trie: Trie<'a>,
+    charwise_daac: Option<CharwiseDaacIndex>,
     word_id_table: WordIdTable<'a>,
     word_params: WordParams<'a>,
     word_infos: WordInfos<'a>,
@@ -60,6 +63,7 @@ impl<'a> Lexicon<'a> {
     pub fn from_binary(binary_lexicon: BinaryLexicon<'a>) -> Self {
         Self {
             trie: binary_lexicon.trie,
+            charwise_daac: binary_lexicon.charwise_daac,
             word_id_table: binary_lexicon.word_id_table,
             word_params: binary_lexicon.word_params,
             word_infos: binary_lexicon.word_infos,
@@ -152,6 +156,72 @@ impl<'a> Lexicon<'a> {
             });
     }
 
+    /// Batch common-prefix trie walk that emits raw trie hits without touching
+    /// the word-id table.
+    #[inline]
+    pub(crate) fn lookup_trie_batch<F>(&self, input: &[u8], starts: &[usize], mut emit: F)
+    where
+        F: FnMut(usize, LexiconTrieHit),
+    {
+        debug_assert!(self.lex_id < MAX_DICTIONARIES as u8);
+        crate::dic::lexicon::trie::probe_init_from_env();
+        let lanes =
+            crate::dic::lexicon::trie::PROBE_LANES.load(std::sync::atomic::Ordering::Relaxed);
+        let pf =
+            crate::dic::lexicon::trie::PROBE_PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
+        self.trie
+            .common_prefix_batch_cfg(input, starts, lanes, pf, |bucket, value, end| {
+                emit(
+                    bucket,
+                    LexiconTrieHit {
+                        trie_value: value,
+                        end,
+                        dict_id: self.lex_id,
+                    },
+                );
+            });
+    }
+
+    /// Single-pass DAAC all-match lookup over the whole input. Returns false
+    /// when the dictionary was built without the optional DAAC block.
+    #[inline]
+    pub(crate) fn lookup_daac_all_matches<F>(&self, input: &str, mut emit: F) -> bool
+    where
+        F: FnMut(usize, LexiconTrieHit),
+    {
+        let Some(index) = &self.charwise_daac else {
+            return false;
+        };
+
+        debug_assert!(self.lex_id < MAX_DICTIONARIES as u8);
+        for mat in index.find_overlapping_iter(input) {
+            emit(
+                mat.start(),
+                LexiconTrieHit {
+                    trie_value: mat.value(),
+                    end: mat.end(),
+                    dict_id: self.lex_id,
+                },
+            );
+        }
+        true
+    }
+
+    #[inline]
+    pub(crate) fn has_daac_index(&self) -> bool {
+        self.charwise_daac.is_some()
+    }
+
+    /// Expand a raw trie value into entry IDs. Kept separate from
+    /// [`Lexicon::lookup_trie_batch`] so the batch phase stays trie-only.
+    #[inline]
+    pub(crate) fn entry_ids_for_trie_value(
+        &self,
+        trie_value: u32,
+    ) -> impl Iterator<Item = EntryId> + '_ {
+        self.word_id_table.entries(trie_value as usize)
+    }
+
     /// Returns end offsets of trie prefixes that match given input.
     #[inline]
     pub(crate) fn lookup_prefix_ends(
@@ -217,6 +287,17 @@ impl<'a> Lexicon<'a> {
 
         Ok(())
     }
+}
+
+/// Raw trie hit emitted by the batch common-prefix walk.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LexiconTrieHit {
+    /// Trie leaf value: offset into the owning lexicon's WordIdTable.
+    pub(crate) trie_value: u32,
+    /// Byte index of the matched word end.
+    pub(crate) end: usize,
+    /// Dictionary that owns the trie hit.
+    pub(crate) dict_id: u8,
 }
 
 /// Result of the Lexicon lookup

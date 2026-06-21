@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::dic::binary_loader::BinaryLexicon;
 use crate::dic::lexicon::strings::StringPointer;
-use crate::dic::lexicon::{Lexicon, LexiconEntry, MAX_DICTIONARIES};
+use crate::dic::lexicon::{Lexicon, LexiconEntry, LexiconTrieHit, MAX_DICTIONARIES};
 use crate::dic::subset::InfoSubset;
 use crate::dic::word_id::{DictId, WordId};
 use crate::dic::word_info::{WordInfo, WordInfoEntryIdCursor};
@@ -151,6 +151,48 @@ impl LexiconSet<'_> {
         }
     }
 
+    /// Batch trie walk that keeps lookup in the trie array only. The raw hits
+    /// can be expanded later with [`LexiconSet::entries_for_trie_hit`].
+    #[inline]
+    pub(crate) fn lookup_trie_batch<F>(&self, input: &[u8], starts: &[usize], mut emit: F)
+    where
+        F: FnMut(usize, LexiconTrieHit),
+    {
+        if self.lexicons.iter().all(Lexicon::has_daac_index) {
+            let input_str = std::str::from_utf8(input).expect("Sudachi input must be UTF-8");
+            let mut bucket_for_byte = vec![usize::MAX; input.len() + 1];
+            for (bucket, &start) in starts.iter().enumerate() {
+                bucket_for_byte[start] = bucket;
+            }
+            for lexicon in self.lexicons.iter().rev() {
+                lexicon.lookup_daac_all_matches(input_str, |start, hit| {
+                    let bucket = bucket_for_byte[start];
+                    if bucket != usize::MAX {
+                        emit(bucket, hit);
+                    }
+                });
+            }
+            return;
+        }
+
+        for lexicon in self.lexicons.iter().rev() {
+            lexicon.lookup_trie_batch(input, starts, &mut emit);
+        }
+    }
+
+    /// Expand one raw trie hit into the same entries [`LexiconSet::lookup`]
+    /// would have yielded for that trie leaf.
+    #[inline]
+    pub(crate) fn entries_for_trie_hit(
+        &self,
+        hit: LexiconTrieHit,
+    ) -> impl Iterator<Item = LexiconEntry> + '_ {
+        let lexicon = &self.lexicons[hit.dict_id as usize];
+        lexicon
+            .entry_ids_for_trie_value(hit.trie_value)
+            .map(move |eid| LexiconEntry::new(WordId::new(hit.dict_id, eid.as_raw()), hit.end))
+    }
+
     /// Checks prefix end offsets in the same dictionary order as lookup(), but
     /// without expanding trie leaves into word IDs.
     #[inline]
@@ -275,9 +317,13 @@ impl LexiconSet<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::dic::binary_loader::LoadedDictionary;
+    use crate::dic::binary_loader::{BinaryDictionary, LoadedDictionary};
+    use crate::dic::build::DictBuilder;
+    use crate::dic::description::{Block, Description};
+    use crate::dic::lexicon::{LexiconEntry, LexiconTrieHit};
 
     const TEST_SYSTEM_DIC: &[u8] = include_bytes!("../../tests/resources/system.dic.test");
+    const TEST_USER_DIC: &[u8] = include_bytes!("../../tests/resources/user.dic.test");
 
     #[test]
     fn check_prefix_ends_matches_lookup_end_order() {
@@ -320,6 +366,112 @@ mod tests {
 
                 assert_eq!(checked_ends, expected_ends);
             }
+        }
+    }
+
+    #[test]
+    fn trie_hit_batch_expands_to_lookup_order() {
+        let dictionary = LoadedDictionary::load_system(TEST_SYSTEM_DIC)
+            .unwrap()
+            .merge_dictionary(BinaryDictionary::load_user(TEST_USER_DIC).unwrap())
+            .unwrap();
+        let lexicon_set = &dictionary.lexicon_set;
+        let inputs = [
+            "東京都に行く",
+            "東京府に行く",
+            "京都東京都x",
+            "アイアイウ",
+            "ぴらる",
+            "",
+        ];
+
+        for input in inputs {
+            let bytes = input.as_bytes();
+            let starts = input
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(bytes.len()))
+                .collect::<Vec<_>>();
+            let expected = starts
+                .iter()
+                .map(|&offset| {
+                    lexicon_set
+                        .lookup(bytes, offset)
+                        .collect::<Vec<LexiconEntry>>()
+                })
+                .collect::<Vec<_>>();
+            let mut hits = vec![Vec::<LexiconTrieHit>::new(); starts.len()];
+
+            lexicon_set.lookup_trie_batch(bytes, &starts, |bucket, hit| {
+                hits[bucket].push(hit);
+            });
+
+            let got = hits
+                .iter()
+                .map(|bucket| {
+                    bucket
+                        .iter()
+                        .flat_map(|&hit| lexicon_set.entries_for_trie_hit(hit))
+                        .collect::<Vec<LexiconEntry>>()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(got, expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn compiled_daac_batch_expands_to_lookup_order() {
+        let mut bldr = DictBuilder::new_system();
+        bldr.set_charwise_daac_index(true);
+        bldr.read_conn(include_bytes!("build/test/matrix_10x10.def"))
+            .unwrap();
+        bldr.read_lexicon(include_bytes!("build/test/data_3words.csv"))
+            .unwrap();
+        bldr.resolve().unwrap();
+
+        let mut bin = Vec::new();
+        bldr.compile(&mut bin).unwrap();
+
+        let desc = Description::load(&bin).unwrap();
+        assert!(desc.slice(&bin, Block::CharwiseDAACIndex).is_ok());
+
+        let dictionary = LoadedDictionary::load_system(&bin).unwrap();
+        let lexicon_set = &dictionary.lexicon_set;
+        assert!(lexicon_set.lexicons.iter().all(|lex| lex.has_daac_index()));
+
+        for input in ["京都東京東x", "東京京都", "東東東京"] {
+            let bytes = input.as_bytes();
+            let starts = input
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(bytes.len()))
+                .collect::<Vec<_>>();
+            let expected = starts
+                .iter()
+                .map(|&offset| {
+                    lexicon_set
+                        .lookup(bytes, offset)
+                        .collect::<Vec<LexiconEntry>>()
+                })
+                .collect::<Vec<_>>();
+            let mut hits = vec![Vec::<LexiconTrieHit>::new(); starts.len()];
+
+            lexicon_set.lookup_trie_batch(bytes, &starts, |bucket, hit| {
+                hits[bucket].push(hit);
+            });
+
+            let got = hits
+                .iter()
+                .map(|bucket| {
+                    bucket
+                        .iter()
+                        .flat_map(|&hit| lexicon_set.entries_for_trie_hit(hit))
+                        .collect::<Vec<LexiconEntry>>()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(got, expected, "input={input:?}");
         }
     }
 }
