@@ -19,6 +19,7 @@ pub mod build;
 pub mod category_type;
 pub mod character_category;
 pub mod connect;
+pub mod connect_sparse;
 pub mod description;
 pub mod dictionary;
 mod dictionary_access;

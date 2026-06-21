@@ -88,6 +88,19 @@ impl<'a> Grammar<'a> {
         &self.connection
     }
 
+    /// Replace the dense connection matrix with an additive + sparse-residual
+    /// form keeping `|M − A − B| >= lambda` (issue-117). `lambda == 0` is
+    /// byte-identical. Returns `(nnz, heap_bytes)` of the sparse form.
+    pub fn sparsify_connection(&mut self, lambda: i32) -> (usize, usize) {
+        self.connection.sparsify(lambda)
+    }
+
+    /// Replace the dense matrix with a co-clustered class block (lossy, L1-fit).
+    /// Returns `heap_bytes` of the block form.
+    pub fn blockify_connection(&mut self, k: usize, sample: usize, iters: usize) -> usize {
+        self.connection.blockify(k, sample, iters)
+    }
+
     /// Sets character category
     ///
     /// This is the only way to set character category.

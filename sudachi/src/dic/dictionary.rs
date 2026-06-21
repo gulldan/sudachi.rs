@@ -170,6 +170,21 @@ impl JapaneseDictionary {
         &self._grammar
     }
 
+    /// Replace the dense connection matrix with an additive + sparse-residual
+    /// form keeping `|M − A − B| >= lambda` (issue-117 matrix simplification).
+    /// `lambda == 0` is byte-identical. Call before wrapping the dictionary in an
+    /// `Arc`. Returns `(nnz, heap_bytes)` of the sparse form.
+    pub fn sparsify_matrix(&mut self, lambda: i32) -> (usize, usize) {
+        self._grammar.sparsify_connection(lambda)
+    }
+
+    /// Replace the dense connection matrix with a co-clustered class block
+    /// (issue-117, lossy, L1-fit). Call before wrapping in `Arc`. Returns
+    /// `heap_bytes` of the block form.
+    pub fn blockify_matrix(&mut self, k: usize, sample: usize, iters: usize) -> usize {
+        self._grammar.blockify_connection(k, sample, iters)
+    }
+
     /// Returns lexicon with the correct lifetime
     pub fn lexicon(&self) -> &LexiconSet<'_> {
         &self._lexicon

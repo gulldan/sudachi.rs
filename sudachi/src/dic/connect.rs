@@ -23,6 +23,18 @@ pub struct ConnectionMatrix<'a> {
     data: CowArray<'a, i16>,
     num_left: usize,
     num_right: usize,
+    /// Clean simplified-matrix override (issue-117). `None` = the dense matrix as
+    /// loaded. Built by [`ConnectionMatrix::sparsify`] / [`ConnectionMatrix::blockify`].
+    simplified: Option<MatrixOverride>,
+}
+
+/// A clean drop-in replacement for the dense connection matrix (issue-117 matrix
+/// simplification). Each variant answers `cost(left, right)`.
+enum MatrixOverride {
+    /// Additive base + sparse residuals; byte-identical at lambda=0.
+    Sparse(crate::dic::connect_sparse::SparseConnectionMatrix),
+    /// Co-clustered class block (small dense, L1-resident); lossy.
+    Block(crate::dic::connect_sparse::BlockClassMatrix),
 }
 
 // ----------------------------------------------------------------------------
@@ -153,6 +165,7 @@ impl<'a> ConnectionMatrix<'a> {
             data: CowArray::from_bytes(data, offset, size),
             num_left,
             num_right,
+            simplified: None,
         })
     }
 
@@ -188,6 +201,11 @@ impl<'a> ConnectionMatrix<'a> {
     /// It is OK to make usage of tampered binary dictionaries UB.
     #[inline(always)]
     pub fn cost(&self, left: u16, right: u16) -> i16 {
+        match &self.simplified {
+            Some(MatrixOverride::Sparse(s)) => return s.cost(left, right),
+            Some(MatrixOverride::Block(b)) => return b.cost(left, right),
+            None => {}
+        }
         if PROBE_REPLACE.load(Ordering::Relaxed) {
             if let Some(m) = REPLACE_MATRIX.get() {
                 return unsafe { *m.get_unchecked(self.index(left, right)) };
@@ -221,6 +239,41 @@ impl<'a> ConnectionMatrix<'a> {
     pub fn update(&mut self, left: u16, right: u16, value: i16) {
         let index = self.index(left, right);
         self.data.set(index, value);
+    }
+
+    /// Replace the dense matrix with an additive base `A[left] + B[right]` plus
+    /// sparse residuals keeping `|M − A − B| >= lambda` (issue-117 matrix
+    /// simplification, eiennohito's "simplify the CRF" direction). `lambda == 0`
+    /// is byte-identical to the dense matrix; larger lambda trades a smaller
+    /// working set for a per-access residual lookup. Returns `(nnz, heap_bytes)`.
+    pub fn sparsify(&mut self, lambda: i32) -> (usize, usize) {
+        let s = crate::dic::connect_sparse::SparseConnectionMatrix::from_dense(
+            &self.data,
+            self.num_left,
+            self.num_right,
+            lambda,
+        );
+        let info = (s.nnz(), s.heap_bytes());
+        self.simplified = Some(MatrixOverride::Sparse(s));
+        info
+    }
+
+    /// Replace the dense matrix with a co-clustered class block (small dense,
+    /// L1-resident, lossy) — the alternative speed candidate to [`Self::sparsify`].
+    /// `k` classes per side, `sample` profile columns, `iters` k-means passes.
+    /// Returns `heap_bytes` of the block form.
+    pub fn blockify(&mut self, k: usize, sample: usize, iters: usize) -> usize {
+        let b = crate::dic::connect_sparse::BlockClassMatrix::from_dense(
+            &self.data,
+            self.num_left,
+            self.num_right,
+            k,
+            sample,
+            iters,
+        );
+        let bytes = b.heap_bytes();
+        self.simplified = Some(MatrixOverride::Block(b));
+        bytes
     }
 
     /// Returns maximum number of left connection ID

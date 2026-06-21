@@ -41,14 +41,21 @@ struct WeightedDoubleArrayBuilder<'a> {
     blocks: Vec<DoubleArrayBlock>,
     used_offsets: HashSet<u32>,
     prefix_hits: &'a HashMap<Vec<u8>, u32>,
+    /// PROBE H2 (eiennohito offset-similarity): when set, bias offset selection
+    /// toward a per-(byte-depth % 3) running target, so subarrays for each UTF-8
+    /// triplet position get similar relative offsets (modulo values).
+    regular: bool,
+    targets: [u32; 3],
 }
 
 impl<'a> WeightedDoubleArrayBuilder<'a> {
-    fn new(prefix_hits: &'a HashMap<Vec<u8>, u32>) -> Self {
+    fn new(prefix_hits: &'a HashMap<Vec<u8>, u32>, regular: bool) -> Self {
         Self {
             blocks: vec![DoubleArrayBlock::new(0)],
             used_offsets: HashSet::new(),
             prefix_hits,
+            regular,
+            targets: [0; 3],
         }
     }
 
@@ -119,11 +126,14 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
 
         let label_bytes = labels.iter().map(|(l, _, _)| *l).collect::<Vec<_>>();
         let offset = loop {
-            if let Some(offset) = self.find_offset(unit_id, &label_bytes) {
+            if let Some(offset) = self.find_offset(unit_id, &label_bytes, depth) {
                 break offset;
             }
             self.extend_block();
         };
+        if self.regular {
+            self.targets[depth % 3] = offset;
+        }
         self.used_offsets.insert(offset);
         let has_leaf = label_bytes.first().copied() == Some(0);
         let parent = self.get_unit_mut(unit_id);
@@ -171,8 +181,33 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
         self.prefix_hits.get(&child).copied().unwrap_or(0)
     }
 
-    fn find_offset(&self, unit_id: UnitID, labels: &[u8]) -> Option<u32> {
+    fn find_offset(&self, unit_id: UnitID, labels: &[u8], depth: usize) -> Option<u32> {
         let head_block = (self.blocks.len() as i32 - NUM_TARGET_BLOCKS).max(0) as usize;
+        if self.regular {
+            // Among the first K valid offsets in the searched blocks, pick the one
+            // whose value shares the most high bits with this triplet-position's
+            // running target (smallest XOR distance). K-capped so build stays fast.
+            const K: usize = 64;
+            let target = self.targets[depth % 3];
+            let mut best: Option<u32> = None;
+            let mut seen = 0usize;
+            'outer: for block in self.blocks.iter().skip(head_block) {
+                for offset in block.find_offset(unit_id, labels) {
+                    let offset_u32 = (block.id as u32) << 8 | offset as u32;
+                    if self.used_offsets.contains(&offset_u32) {
+                        continue;
+                    }
+                    if best.is_none() || (offset_u32 ^ target) < (best.unwrap() ^ target) {
+                        best = Some(offset_u32);
+                    }
+                    seen += 1;
+                    if seen >= K {
+                        break 'outer;
+                    }
+                }
+            }
+            return best;
+        }
         self.blocks.iter().skip(head_block).find_map(|block| {
             for offset in block.find_offset(unit_id, labels) {
                 let offset_u32 = (block.id as u32) << 8 | offset as u32;
@@ -329,5 +364,6 @@ pub fn build_weighted(entries: &[(&str, u32)], corpus: &str) -> Option<Vec<u8>> 
         .iter()
         .map(|(k, v)| (k.as_bytes().to_vec(), *v))
         .collect();
-    WeightedDoubleArrayBuilder::new(&prefix_hits).build(&keyset)
+    let regular = std::env::var("SUDACHI_LAYOUT_OFFSET_REGULAR").is_ok();
+    WeightedDoubleArrayBuilder::new(&prefix_hits, regular).build(&keyset)
 }
