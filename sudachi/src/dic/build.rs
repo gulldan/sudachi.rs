@@ -41,7 +41,7 @@ pub(crate) mod lexicon;
 pub(crate) mod parse;
 pub(crate) mod pos;
 pub mod report;
-pub(crate) mod weighted_trie;
+pub mod weighted_trie;
 mod resolve;
 #[cfg(test)]
 mod test;
