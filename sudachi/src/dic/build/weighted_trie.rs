@@ -186,8 +186,9 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
         if self.regular {
             // Among the first K valid offsets in the searched blocks, pick the one
             // whose value shares the most high bits with this triplet-position's
-            // running target (smallest XOR distance). K-capped so build stays fast.
-            const K: usize = 64;
+            // running target (smallest XOR distance). K-capped so build stays fast
+            // (SUDACHI_LAYOUT_OFFSET_K, default 16).
+            let cap = offset_cap();
             let target = self.targets[depth % 3];
             let mut best: Option<u32> = None;
             let mut seen = 0usize;
@@ -201,7 +202,7 @@ impl<'a> WeightedDoubleArrayBuilder<'a> {
                         best = Some(offset_u32);
                     }
                     seen += 1;
-                    if seen >= K {
+                    if seen >= cap {
                         break 'outer;
                     }
                 }
@@ -309,6 +310,19 @@ impl Iterator for FindOffset<'_> {
             }
         }
     }
+}
+
+/// PROBE H2: cached cap on the offset-similarity candidate search
+/// (SUDACHI_LAYOUT_OFFSET_K, default 16). Read once; controls build time.
+fn offset_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("SUDACHI_LAYOUT_OFFSET_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    })
 }
 
 fn unit_at(bytes: &[u8], idx: usize) -> Option<u32> {
